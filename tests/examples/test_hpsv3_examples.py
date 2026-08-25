@@ -24,24 +24,44 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.parametrize(
-    ("path", "model_type", "config_file", "eval_steps"),
+    ("path", "model_type", "config_file", "train_steps", "eval_steps"),
     (
+        (
+            "examples/grpo/lora/flux2/hpsv3_2x8.yaml",
+            "flux2",
+            "config/accelerate_configs/fsdp2.yaml",
+            8,
+            28,
+        ),
         (
             "examples/grpo/lora/qwen_image/hpsv3_2x8.yaml",
             "qwen-image",
             "config/accelerate_configs/fsdp2.yaml",
+            10,
             50,
+        ),
+        (
+            "examples/grpo/lora/z_image/hpsv3_2x8.yaml",
+            "z-image",
+            "config/deepspeed/deepspeed_zero2.yaml",
+            10,
+            40,
         ),
         (
             "examples/grpo/lora/sd3_5/hpsv3_2x8_medium.yaml",
             "sd3-5",
             "config/deepspeed/deepspeed_zero2.yaml",
+            10,
             40,
         ),
     ),
 )
 def test_hpsv3_two_node_examples_parse(
-    path: str, model_type: str, config_file: str, eval_steps: int
+    path: str,
+    model_type: str,
+    config_file: str,
+    train_steps: int,
+    eval_steps: int,
 ) -> None:
     config = Arguments.load_from_yaml(str(ROOT / path))
     reward = config.reward_args[0]
@@ -52,7 +72,7 @@ def test_hpsv3_two_node_examples_parse(
     assert config.num_machines == 2
     assert config.data_args.preprocess_parallelism == "local"
     assert config.data_args.sampler_type == "group_contiguous"
-    assert config.training_args.num_inference_steps == 10
+    assert config.training_args.num_inference_steps == train_steps
     assert config.eval_args.num_inference_steps == eval_steps
     assert config.training_args.group_size == 16
     assert config.training_args.unique_sample_num_per_epoch == 48

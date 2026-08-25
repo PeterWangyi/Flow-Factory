@@ -29,8 +29,12 @@ ff-train examples/grpo/lora/flux1/default.yaml
 The following starting points target two 8-GPU, 80 GB nodes and an HPSv3
 service exposing `POST /score`:
 
+- [`FLUX.2-dev`](grpo/lora/flux2/hpsv3_2x8.yaml): FSDP2, 8-step training
+  rollouts, and 28-step evaluation.
 - [`Qwen-Image-2512`](grpo/lora/qwen_image/hpsv3_2x8.yaml): FSDP2, 10-step
   training rollouts, and 50-step evaluation.
+- [`Z-Image`](grpo/lora/z_image/hpsv3_2x8.yaml): DeepSpeed ZeRO-2, 10-step
+  training rollouts, and 40-step evaluation.
 - [`SD3.5 Medium`](grpo/lora/sd3_5/hpsv3_2x8_medium.yaml): DeepSpeed ZeRO-2,
   10-step training rollouts, and 40-step evaluation.
 
@@ -45,19 +49,22 @@ python scripts/prepare_aesthetics_prompts.py \
   --seed 42
 ```
 
-Run the same command on both nodes after setting a reachable master address and
-the node-specific rank:
+Use the shared launcher on both nodes. Pass the same model and master address,
+but use rank 0 on the master and rank 1 on the second node:
 
 ```bash
-export MASTER_ADDR="10.0.0.1"
-export MASTER_PORT="29500"
-export NUM_MACHINES="2"
-export GPUS_PER_NODE="8"
-export MACHINE_RANK="0"  # use 1 on the second node
+# Master node
+bash peter_training/test_scripts/launch_hpsv3_2x8.sh qwen-image 0 10.0.0.1
 
-ff-train examples/grpo/lora/qwen_image/hpsv3_2x8.yaml
-# Or: ff-train examples/grpo/lora/sd3_5/hpsv3_2x8_medium.yaml
+# Second node
+bash peter_training/test_scripts/launch_hpsv3_2x8.sh qwen-image 1 10.0.0.1
 ```
+
+Replace `qwen-image` with `flux2`, `z-image`, or `sd3.5` to select another
+recipe. Environment-only invocation is also supported through `FF_MODEL`,
+`MACHINE_RANK`, and `MASTER_ADDR`. Set `FF_LOG_DIR` to change the per-node log
+directory; extra positional arguments after the master address are forwarded to
+`ff-train`.
 
 The dataset path must exist on both nodes. With local preprocessing, the cache
 need not be shared. Before a long run, verify `/healthz` or `/health` and one

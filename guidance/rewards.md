@@ -641,8 +641,12 @@ requests at once. Increase `num_workers` only after confirming that the service
 can absorb the resulting `world_size * num_workers` concurrency.
 
 Complete 2-node examples are available for
-[`Qwen-Image`](../examples/grpo/lora/qwen_image/hpsv3_2x8.yaml) and
-[`SD3.5 Medium`](../examples/grpo/lora/sd3_5/hpsv3_2x8_medium.yaml).
+[`FLUX.2`](../examples/grpo/lora/flux2/hpsv3_2x8.yaml),
+[`Qwen-Image`](../examples/grpo/lora/qwen_image/hpsv3_2x8.yaml),
+[`Z-Image`](../examples/grpo/lora/z_image/hpsv3_2x8.yaml), and
+[`SD3.5 Medium`](../examples/grpo/lora/sd3_5/hpsv3_2x8_medium.yaml). Launch any
+of them on both nodes with
+`peter_training/test_scripts/launch_hpsv3_2x8.sh`.
 
 ### Server Dependencies
 
