@@ -1,0 +1,114 @@
+# SD3.5 Medium GRPO + remote HPSv3 starting point for 2 nodes x 8 x 80 GB.
+# Training uses 10-step Flow-SDE rollouts; evaluation keeps the standard 40 steps.
+
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 16
+num_machines: 2
+main_process_port: 29500
+mixed_precision: "bf16"
+
+data:
+  datasets:
+    - name: aesthetics
+      dataset_dir: "peter_data/dataset/aesthetics/filter-hps-std-gt-0.4-caption-8192"
+      train:
+        weight: 1
+        max_dataset_size: 8192
+      eval:
+        split: test
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 8
+  enable_preprocess: true
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/sd3_5_hpsv3"
+  preprocess_parallelism: local
+  sampler_type: "group_contiguous"
+
+model:
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  finetune_type: "lora"
+  lora_rank: 32
+  lora_alpha: 64
+  target_components: "transformer"
+  target_modules: "default"
+  frozen_parameters_dtype:
+    default: null
+    transformers: "bf16"
+    text_encoders: "bf16"
+    vae: "bf16"
+  trainable_parameters_dtype: "bf16"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: "sd3_5_medium_hpsv3_grpo_2x8"
+  project: "Flow-Factory"
+  logging_backend: "wandb"
+  save_dir: "saves/sd3_5_medium_hpsv3_2x8"
+  save_freq: 20
+  save_model_only: true
+
+train:
+  trainer_type: "grpo"
+  max_epochs: 200
+  advantage_aggregation: "sum"
+  clip_range: 1.0e-4
+  adv_clip_range: 5.0
+  kl_type: "v-based"
+  kl_beta: 0
+  ref_param_device: "cuda"
+  resolution: 512
+  num_inference_steps: 10
+  guidance_scale: 4.5
+  per_device_batch_size: 8
+  group_size: 16
+  global_std: false
+  unique_sample_num_per_epoch: 48
+  gradient_step_per_epoch: 2
+  gradient_accumulation_steps: "auto"
+  enable_gradient_checkpointing: true
+  offload_samples_to_cpu: false
+  ema_decay: 0.99
+  ema_update_interval: 4
+  ema_device: "cuda"
+  seed: 42
+
+scheduler:
+  dynamics_type: "Flow-SDE"
+  noise_level: 0.8
+  num_sde_steps: 2
+  sde_steps: [1, 2, 3, 4, 5]
+  seed: 42
+
+eval:
+  resolution: 1024
+  per_device_batch_size: 1
+  guidance_scale: 4.5
+  num_inference_steps: 40
+  eval_freq: 20
+  seed: 42
+
+rewards:
+  - name: "hpsv3_aesthetic"
+    reward_model: "hpsv3_service"
+    weight: 1.0
+    batch_size: 1
+    device: "cpu"
+    dtype: "float32"
+    async_reward: true
+    num_workers: 1
+    server_url: "http://10.119.26.83:9010"
+    timeout: 120.0
+    health_timeout: 5.0
+    retry_attempts: 3
+    applicable_datasets: [aesthetics]
+
+optimizers:
+  - name: "default"
+    learning_rate: 3.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    max_grad_norm: 1.0

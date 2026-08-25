@@ -44,6 +44,7 @@ Flow-Factory supports two paradigms for computing rewards:
 | `GenEval` | Pointwise | Compositional T2I evaluation (object count, color, position) via Mask2Former + CLIP | [GenEval](https://github.com/djghosh13/geneval) |
 | `geneval2_soft_tifa` | Pointwise | GenEval2 Soft-TIFA: per-atom VQA soft-match via local Qwen3-VL, AM/GM aggregation; `vqa_list` from dataset `metadata` or a `data_path` JSONL. Needs `pip install -e ".[geneval2]"` for exact GM parity | [GenEval2](https://github.com/facebookresearch/GenEval2) |
 | `hpsv2` | Pointwise | Human Preference Score v2 (OpenCLIP ViT-H-14 + HPS checkpoint). Install with `uv pip install hpsv2 --no-deps` | [HPSv2](https://github.com/tgxs002/HPSv2) |
+| `hpsv3_service` | Pointwise | Single-image HPSv3 HTTP client using `POST /score`; the reward model remains in an isolated remote environment | [HPSv3 service](#hpsv3-single-image-service) |
 | `vllm_evaluate` | Pointwise | VLM with a binary Yes/No question; reward from logprobs via OpenAI-compatible API | [VLM-as-Judge](#vlm-as-judge) |
 | `rational_rewards_t2i` | Pointwise | T2I rubric judge (remote VLM); see [VLM-as-Judge](#vlm-as-judge) and [Example: Rational Rewards](#example-rational-rewards) | [Rational Rewards](https://github.com/TIGER-AI-Lab/RationalRewards) |
 | `rational_rewards_edit` | Pointwise | Image-edit rubric (source + edited). Same setup family as T2I variant | [Rational Rewards](https://github.com/TIGER-AI-Lab/RationalRewards) |
@@ -602,6 +603,46 @@ rewards:
     timeout: 60.0        # optional, default 60s
     retry_attempts: 3    # optional, default 3
 ```
+
+### HPSv3 Single-Image Service
+
+Use `hpsv3_service` when an existing HPSv3 server scores one prompt-image pair
+per request. The client probes `/healthz` and then `/health`, sends PNG bytes as
+base64 to `POST /score`, and expects a finite scalar in the following contract:
+
+```json
+{"prompt": "a studio portrait", "image_base64": "..."}
+```
+
+```json
+{"score": 0.73}
+```
+
+Configure it as a pointwise, asynchronous CPU reward:
+
+```yaml
+rewards:
+  - name: "hpsv3_aesthetic"
+    reward_model: "hpsv3_service"
+    batch_size: 1
+    device: "cpu"
+    dtype: "float32"
+    async_reward: true
+    num_workers: 1
+    server_url: "http://10.119.26.83:9010"
+    timeout: 120.0
+    health_timeout: 5.0
+    retry_attempts: 3
+```
+
+`batch_size: 1` matches the single-image endpoint. Worker concurrency is per
+training process: a 16-GPU run with `num_workers: 1` can issue approximately 16
+requests at once. Increase `num_workers` only after confirming that the service
+can absorb the resulting `world_size * num_workers` concurrency.
+
+Complete 2-node examples are available for
+[`Qwen-Image`](../examples/grpo/lora/qwen_image/hpsv3_2x8.yaml) and
+[`SD3.5 Medium`](../examples/grpo/lora/sd3_5/hpsv3_2x8_medium.yaml).
 
 ### Server Dependencies
 

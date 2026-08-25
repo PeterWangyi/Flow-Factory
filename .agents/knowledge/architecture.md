@@ -145,6 +145,7 @@ All four registries map string keys → lazy import paths. Resolution: registry 
 | `geneval` | `GenEvalRewardModel` | Pointwise |
 | `geneval2_soft_tifa` | `GenEval2SoftTIFARewardModel` | Pointwise |
 | `hpsv2` | `HPSv2RewardModel` | Pointwise |
+| `hpsv3_service` | `HPSv3ServiceRewardModel` | Pointwise |
 | `qwen_image_bench` | `QwenImageBenchRewardModel` | Pointwise |
 
 **Accelerators** (`acceleration/registry.py`):

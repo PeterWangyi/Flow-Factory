@@ -24,6 +24,45 @@ examples/{algorithm}/{finetune_type}/{model_type}/{variant}.yaml
 ff-train examples/grpo/lora/flux1/default.yaml
 ```
 
+## Two-node HPSv3 GRPO recipes
+
+The following starting points target two 8-GPU, 80 GB nodes and an HPSv3
+service exposing `POST /score`:
+
+- [`Qwen-Image-2512`](grpo/lora/qwen_image/hpsv3_2x8.yaml): FSDP2, 10-step
+  training rollouts, and 50-step evaluation.
+- [`SD3.5 Medium`](grpo/lora/sd3_5/hpsv3_2x8_medium.yaml): DeepSpeed ZeRO-2,
+  10-step training rollouts, and 40-step evaluation.
+
+First create the compact, uniformly sampled 8192-prompt dataset. This writes a
+new directory and leaves the source files untouched:
+
+```bash
+python scripts/prepare_aesthetics_prompts.py \
+  --input-dir /mnt/aigc/wangyubo/code/IG/neo/RL/Flow-Factory/peter_data/dataset/aesthetics/filter-hps-std-gt-0.4 \
+  --output-dir /mnt/aigc/wangyubo/code/IG/neo/RL/Flow-Factory/peter_data/dataset/aesthetics/filter-hps-std-gt-0.4-caption-8192 \
+  --train-limit 8192 \
+  --seed 42
+```
+
+Run the same command on both nodes after setting a reachable master address and
+the node-specific rank:
+
+```bash
+export MASTER_ADDR="10.0.0.1"
+export MASTER_PORT="29500"
+export NUM_MACHINES="2"
+export GPUS_PER_NODE="8"
+export MACHINE_RANK="0"  # use 1 on the second node
+
+ff-train examples/grpo/lora/qwen_image/hpsv3_2x8.yaml
+# Or: ff-train examples/grpo/lora/sd3_5/hpsv3_2x8_medium.yaml
+```
+
+The dataset path must exist on both nodes. With local preprocessing, the cache
+need not be shared. Before a long run, verify `/healthz` or `/health` and one
+`/score` request from each training node, then use a one-epoch smoke run.
+
 ## DMD2 and TDM
 
 - [`dmd2` SD3.5 OCR recipe](dmd2/lora/sd3_5/ocr.yaml) — validated in a
