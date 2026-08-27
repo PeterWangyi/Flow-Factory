@@ -86,6 +86,14 @@ Based on the fix type, write the fix entry to the appropriate document:
 - **Lesson**: Reflection is only a default. Dynamic preprocessors need an explicit cache contract.
 - **Related Constraint**: N/A
 
+### Compressed logger media must remain preview-readable
+- **Date**: 2026-08-27
+- **Symptom**: Static reports could load through the preview gateway, but W&B eval images returned headers and no response body.
+- **Root Cause**: `LogImage` compressed PIL images through `tempfile.mkstemp()`, which creates mode `0600`, and W&B preserved that mode when copying the files into its media directory.
+- **Fix**: `LogImage.get_value()` now changes successfully written JPEGs to `0644`, with a regression test covering the resulting permission bits.
+- **Lesson**: Secure temporary-file defaults are unsuitable for media that a separate preview service must read; set the intended sharing boundary explicitly after the file is complete.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

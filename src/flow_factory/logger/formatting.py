@@ -317,6 +317,7 @@ class LogImage:
             try:
                 with os.fdopen(fd, "wb") as f:
                     img.convert("RGB").save(f, format="JPEG", quality=self.quality)
+                os.chmod(path, 0o644)
                 self._temp_paths[cache_key] = path
             except Exception as e:
                 if os.path.exists(path):
