@@ -1,8 +1,8 @@
-# Qwen-Image GRPO + remote HPSv3 starting point for 2 nodes x 8 x 80 GB.
-# Training uses 10-step Flow-SDE rollouts; evaluation uses the normal 50-step path.
+# Z-Image GRPO + remote HPSv3 starting point for 2 nodes x 8 x 80 GB.
+# Training uses 10-step Flow-SDE rollouts and 40-step evaluation.
 
 launcher: "accelerate"
-config_file: config/accelerate_configs/fsdp2.yaml
+config_file: config/deepspeed/deepspeed_zero2.yaml
 num_processes: 16
 num_machines: 2
 main_process_port: 29500
@@ -11,36 +11,37 @@ mixed_precision: "bf16"
 data:
   datasets:
     - name: aesthetics
-      dataset_dir: "peter_data/dataset/aesthetics/filter-hps-std-gt-0.4-caption-8192"
+      dataset_dir: "peter_data/dataset/aesthetics/filter-hps-std-gt-0.4_human"
       train:
         weight: 1
         max_dataset_size: 8192
       eval:
         split: test
-  preprocessing_batch_size: 1
+  preprocessing_batch_size: 8
   dataloader_num_workers: 8
   enable_preprocess: true
   force_reprocess: false
-  cache_dir: "/mnt/aigc/wangyubo/.cache/flow_factory/qwen_image_hpsv3"
+  cache_dir: "/mnt/aigc/wangyubo/.cache/flow_factory/z_image_hpsv3"
   preprocess_parallelism: global
   sampler_type: "group_contiguous"
 
 model:
-  model_name_or_path: "/mnt/aigc/zoemodels/Qwen-Image/Qwen-Image"
-  model_type: "qwen-image"
+  model_name_or_path: "/mnt/aigc/zoemodels/Z-Image/Z-Image"
+  model_type: "z-image"
   finetune_type: "lora"
   lora_rank: 64
   lora_alpha: 128
+  trainable_parameters_dtype: "fp32"
   target_components: "transformer"
   target_modules: "default"
   resume_path: null
   resume_type: null
 
 log:
-  run_name: "qwen_image_hpsv3_grpo_2x8_{timestamp}"
+  run_name: "[Z-Image]-data-u15human-reward-hpsv3-{timestamp}"
   project: "Flow-Factory"
   logging_backend: "wandb"
-  save_dir: "saves/qwen_image_hpsv3_2x8"
+  save_dir: "saves/z_image_hpsv3_2x8"
   save_freq: 20
   save_model_only: true
 
@@ -62,16 +63,16 @@ train:
   unique_sample_num_per_epoch: 48
   gradient_step_per_epoch: 2
   gradient_accumulation_steps: "auto"
-  enable_gradient_checkpointing: true
+  enable_gradient_checkpointing: false
   offload_samples_to_cpu: false
-  ema_decay: 0.0
+  ema_decay: 0.9
   ema_update_interval: 4
   ema_device: "cuda"
   seed: 42
 
 scheduler:
   dynamics_type: "Flow-SDE"
-  noise_level: 1.0
+  noise_level: 0.7
   num_sde_steps: 1
   sde_steps: [1, 2, 3]
   seed: 42
@@ -80,7 +81,7 @@ eval:
   resolution: 1024
   per_device_batch_size: 1
   guidance_scale: 4.0
-  num_inference_steps: 50
+  num_inference_steps: 40
   eval_freq: 20
   seed: 42
 
@@ -93,7 +94,7 @@ rewards:
     dtype: "float32"
     async_reward: true
     num_workers: 1
-    server_url: "http://10.119.24.80:9010"
+    server_url: "http://10.119.24.63:9010"
     timeout: 120.0
     health_timeout: 5.0
     retry_attempts: 3

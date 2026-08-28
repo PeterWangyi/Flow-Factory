@@ -17,56 +17,70 @@
 #
 # Positional usage:
 #   bash peter_training/test_scripts/launch_hpsv3_2x8.sh \
-#     <model> <machine_rank> <master_addr> [ff-train args...]
+#     <config.yaml> <machine_rank> [ff-train args...]
 #
 # Environment-only usage:
-#   FF_MODEL=qwen-image MACHINE_RANK=0 MASTER_ADDR=10.0.0.1 \
-#     bash peter_training/test_scripts/launch_hpsv3_2x8.sh
-#
-# Models: flux2, qwen-image, z-image, sd3.5
+#   FF_CONFIG=examples/grpo/lora/qwen_image/hpsv3_2x8.yaml \
+#     MACHINE_RANK=0 bash peter_training/test_scripts/launch_hpsv3_2x8.sh
 
 set -euo pipefail
 
-ff_model="${1:-${FF_MODEL:-qwen-image}}"
+ff_config="${1:-${FF_CONFIG:-}}"
 if [[ $# -gt 0 ]]; then shift; fi
 
 ff_machine_rank="${1:-${MACHINE_RANK:-${NODE_RANK:-}}}"
 if [[ $# -gt 0 ]]; then shift; fi
 
-ff_master_addr="${1:-${MASTER_ADDR:-${MASTER_IP:-}}}"
-if [[ $# -gt 0 ]]; then shift; fi
 
-ff_master_port="${MASTER_PORT:-29500}"
-ff_num_machines="${NUM_MACHINES:-2}"
+
+# ff_master_addr="${1:-${MASTER_ADDR:-${MASTER_IP:-}}}"
+# if [[ $# -gt 0 ]]; then shift; fi
+
+ff_master_port="${MASTER_PORT:-29501}"
+# ff_num_machines="${NUM_MACHINES:-2}"
+ff_num_machines=2
+
+# ff_master_addr=10.119.29.113 # 01
+ff_master_addr=10.119.29.114 # 23
+# ff_master_addr=10.119.18.14 # 45
+# ff_master_addr=10.119.29.112 # 67
+
+
+# cd /mnt/aigc/wangyubo/code/IG/neo/RL/Flow-Factory && conda activate /mnt/aigc/wangyubo/anaconda3/envs/flowfactory
+
+
+# bash peter_training/test_scripts/launch_hpsv3_2x8.sh examples/grpo/lora/z_image/reward_ab/z-image-data-u15human-reward-hpsv3.yaml 0
+
+# bash peter_training/test_scripts/launch_hpsv3_2x8.sh examples/grpo/lora/z_image/reward_ab/z-image-data-u15human-reward-v020realism.yaml 0
+
+# pkill -KILL -f 'peter_training/test_scripts/launch_hpsv3_2x8.sh'
+
+# /mnt/aigc/yanglei/.conda/envs/vlm_eval_kit/bin/hf download \
+#   Thunderbolt215215/UniPercept \
+#   --local-dir /mnt/aigc/zoemodels/UniPercept
+# /mnt/aigc/zoemodels/UniPercept
+
 ff_gpus_per_node="${GPUS_PER_NODE:-8}"
 ff_dry_run="${FF_DRY_RUN:-0}"
 
 ff_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ff_repo_root="$(cd "${ff_script_dir}/../.." && pwd)"
-ff_dataset_dir="${ff_repo_root}/peter_data/dataset/aesthetics/filter-hps-std-gt-0.4-caption-8192"
 
-case "${ff_model,,}" in
-  flux2|flux-2)
-    ff_model_key="flux2"
-    ff_config="examples/grpo/lora/flux2/hpsv3_2x8.yaml"
-    ;;
-  qwen|qwen-image|qwen_image)
-    ff_model_key="qwen-image"
-    ff_config="examples/grpo/lora/qwen_image/hpsv3_2x8.yaml"
-    ;;
-  z|z-image|z_image)
-    ff_model_key="z-image"
-    ff_config="examples/grpo/lora/z_image/hpsv3_2x8.yaml"
-    ;;
-  sd3.5|sd35|sd3-5|sd3_5)
-    ff_model_key="sd3.5"
-    ff_config="examples/grpo/lora/sd3_5/hpsv3_2x8_medium.yaml"
-    ;;
-  *)
-    echo "Unsupported model '${ff_model}'. Choose: flux2, qwen-image, z-image, sd3.5." >&2
-    exit 2
-    ;;
-esac
+if [[ -z "${ff_config}" ]]; then
+  echo "config is required. Pass a YAML path as argument 1 or set FF_CONFIG." >&2
+  exit 2
+fi
+if [[ "${ff_config}" = /* ]]; then
+  ff_config_path="${ff_config}"
+else
+  ff_config_path="${ff_repo_root}/${ff_config}"
+fi
+if [[ ! -f "${ff_config_path}" ]]; then
+  echo "Training config does not exist: ${ff_config_path}" >&2
+  exit 1
+fi
+ff_config_key="$(basename "${ff_config}")"
+ff_config_key="${ff_config_key%.*}"
 
 if [[ -z "${ff_machine_rank}" ]]; then
   echo "machine_rank is required. Pass it as argument 2 or set MACHINE_RANK." >&2
@@ -77,7 +91,7 @@ if [[ "${ff_machine_rank}" != "0" && "${ff_machine_rank}" != "1" ]]; then
   exit 2
 fi
 if [[ -z "${ff_master_addr}" ]]; then
-  echo "master_addr is required. Pass it as argument 3 or set MASTER_ADDR." >&2
+  echo "ff_master_addr must be configured for this launcher." >&2
   exit 2
 fi
 if [[ "${ff_num_machines}" != "2" ]]; then
@@ -88,10 +102,6 @@ if [[ "${ff_gpus_per_node}" != "8" ]]; then
   echo "GPUS_PER_NODE must be 8 for this launcher; got '${ff_gpus_per_node}'." >&2
   exit 2
 fi
-if [[ ! -f "${ff_repo_root}/${ff_config}" ]]; then
-  echo "Training config does not exist: ${ff_repo_root}/${ff_config}" >&2
-  exit 1
-fi
 
 export MASTER_ADDR="${ff_master_addr}"
 export MASTER_PORT="${ff_master_port}"
@@ -101,13 +111,13 @@ export MACHINE_RANK="${ff_machine_rank}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
+export WANDB_MODE="${WANDB_MODE:-online}"
+
 echo "=== Flow-Factory HPSv3 2x8 launch ==="
-echo "Model:          ${ff_model_key}"
 echo "Config:         ${ff_config}"
 echo "Master:         ${MASTER_ADDR}:${MASTER_PORT}"
 echo "Machine rank:   ${MACHINE_RANK}"
 echo "Topology:       ${NUM_MACHINES} nodes x ${GPUS_PER_NODE} GPUs"
-echo "Dataset:        ${ff_dataset_dir}"
 
 cd "${ff_repo_root}"
 
@@ -118,11 +128,6 @@ if [[ "${ff_dry_run}" == "1" ]]; then
   exit 0
 fi
 
-if [[ ! -f "${ff_dataset_dir}/train.jsonl" || ! -f "${ff_dataset_dir}/test.jsonl" ]]; then
-  echo "Prepared dataset is missing under ${ff_dataset_dir}." >&2
-  echo "Run scripts/prepare_aesthetics_prompts.py before launching training." >&2
-  exit 1
-fi
 if ! command -v ff-train >/dev/null 2>&1; then
   echo "ff-train is not available in PATH. Activate the Flow-Factory environment." >&2
   exit 1
@@ -142,9 +147,11 @@ fi
 ff_log_dir="${FF_LOG_DIR:-${ff_repo_root}/logs/hpsv3_2x8}"
 mkdir -p "${ff_log_dir}"
 ff_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-ff_log_file="${ff_log_dir}/${ff_model_key}_node${MACHINE_RANK}_${ff_timestamp}.log"
+ff_log_file="${ff_log_dir}/${ff_config_key}_node${MACHINE_RANK}_${ff_timestamp}.log"
 
 echo "Log:            ${ff_log_file}"
 echo
+
+unset RANK LOCAL_RANK WORLD_SIZE LOCAL_WORLD_SIZE
 
 ff-train "${ff_config}" "$@" 2>&1 | tee "${ff_log_file}"

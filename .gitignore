@@ -141,3 +141,5 @@ dataset/**/*.mov
 # Cursor scratch plans (design/roadmap docs; keep .cursor/rules tracked)
 # ====================
 .cursor/plans/
+
+peter_data/*

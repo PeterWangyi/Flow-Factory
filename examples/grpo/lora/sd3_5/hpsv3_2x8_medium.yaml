@@ -43,7 +43,7 @@ model:
   resume_type: null
 
 log:
-  run_name: "sd3_5_medium_hpsv3_grpo_2x8"
+  run_name: "sd3_5_medium_hpsv3_grpo_2x8_{timestamp}"
   project: "Flow-Factory"
   logging_backend: "wandb"
   save_dir: "saves/sd3_5_medium_hpsv3_2x8"

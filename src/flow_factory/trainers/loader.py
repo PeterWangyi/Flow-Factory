@@ -22,7 +22,7 @@ import logging
 import os
 
 from accelerate import Accelerator, DistributedDataParallelKwargs
-from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.utils import ProjectConfiguration, broadcast_object_list, set_seed
 
 from ..hparams import Arguments, get_training_args_class
 from ..models.loader import load_model
@@ -50,6 +50,23 @@ def _requires_ddp_unused_parameter_detection(
     if required_roles is None:
         required_roles = getattr(training_args_cls, "required_trainable_roles", ())
     return len(tuple(required_roles)) > 1 or adapter_cls.ddp_find_unused_parameters
+
+
+def _synchronize_run_name(config: Arguments, accelerator: Accelerator) -> None:
+    """Broadcast the resolved run name and configure one shared project directory."""
+    run_names = [config.log_args.run_name if accelerator.is_main_process else None]
+    broadcast_object_list(run_names, from_process=0)
+    run_name = run_names[0]
+    if not isinstance(run_name, str) or not run_name:
+        raise RuntimeError(
+            "Expected global process 0 to broadcast a non-empty log.run_name, "
+            f"received {run_name!r}."
+        )
+
+    config.log_args.run_name = run_name
+    accelerator.project_configuration.set_directories(
+        os.path.join(config.log_args.save_dir, run_name)
+    )
 
 
 def load_trainer(config: Arguments) -> BaseTrainer:
@@ -95,9 +112,7 @@ def load_trainer(config: Arguments) -> BaseTrainer:
     os.environ.setdefault("ACCELERATE_GRADIENT_CLIPPING", str(config.training_args.max_grad_norm))
 
     # Initialize Accelerator
-    accelerator_config = ProjectConfiguration(
-        project_dir=os.path.join(config.log_args.save_dir, config.log_args.run_name),
-    )
+    accelerator_config = ProjectConfiguration()
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
         project_config=accelerator_config,
@@ -108,6 +123,7 @@ def load_trainer(config: Arguments) -> BaseTrainer:
     # constructing an adapter under ZeRO-3 can shard parameters immediately, so
     # rejecting it in BaseTrainer.__init__ is too late.
     validate_supported_distributed_plan(accelerator)
+    _synchronize_run_name(config, accelerator)
     set_seed(config.training_args.seed, device_specific=True)
 
     # Reconcile config with runtime distributed state (before any consumer reads it)

@@ -28,7 +28,12 @@ class LogArguments(ArgABC):
 
     run_name: Optional[str] = field(
         default=None,
-        metadata={"help": "Name of the training run."},
+        metadata={
+            "help": (
+                "Name of the training run. Include {timestamp} to replace it with the "
+                "training start time."
+            )
+        },
     )
     project: str = field(
         default="Flow-Factory",

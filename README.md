@@ -171,10 +171,19 @@ To use [Weights & Biases](https://wandb.ai/site/) or [SwanLab](https://github.co
 After installation, set corresponding arguments in the config file:
 
 ```yaml
-run_name: null  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
+run_name: null  # Auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp}
 project: "Flow-Factory"  # Project name for logging
 logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
 ```
+
+Set an explicit prefix while retaining a unique start time with a timestamp placeholder:
+
+```yaml
+run_name: "qwen_image_hpsv3_grpo_2x8_{timestamp}"
+```
+
+At startup, `{timestamp}` is replaced using the `YYYYMMDD_HHMMSS` format. The resolved name is
+shared by the experiment tracker and its checkpoint directory.
 
 These trackers allow you to visualize both **training samples** and **metric curves** online:
 

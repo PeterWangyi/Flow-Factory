@@ -21,12 +21,12 @@ data:
   dataloader_num_workers: 8
   enable_preprocess: true
   force_reprocess: false
-  cache_dir: "~/.cache/flow_factory/z_image_hpsv3"
-  preprocess_parallelism: local
+  cache_dir: "/mnt/aigc/wangyubo/.cache/flow_factory/z_image_hpsv3"
+  preprocess_parallelism: global
   sampler_type: "group_contiguous"
 
 model:
-  model_name_or_path: "Tongyi-MAI/Z-Image"
+  model_name_or_path: "/mnt/aigc/zoemodels/Z-Image/Z-Image"
   model_type: "z-image"
   finetune_type: "lora"
   lora_rank: 64
@@ -38,7 +38,7 @@ model:
   resume_type: null
 
 log:
-  run_name: "z_image_hpsv3_grpo_2x8"
+  run_name: "z_image_hpsv3_grpo_2x8_{timestamp}"
   project: "Flow-Factory"
   logging_backend: "wandb"
   save_dir: "saves/z_image_hpsv3_2x8"
@@ -94,7 +94,7 @@ rewards:
     dtype: "float32"
     async_reward: true
     num_workers: 1
-    server_url: "http://10.119.26.83:9010"
+    server_url: "http://10.119.24.80:9010"
     timeout: 120.0
     health_timeout: 5.0
     retry_attempts: 3

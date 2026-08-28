@@ -1,5 +1,5 @@
-# Qwen-Image GRPO + remote HPSv3 starting point for 2 nodes x 8 x 80 GB.
-# Training uses 10-step Flow-SDE rollouts; evaluation uses the normal 50-step path.
+# FLUX.2 Klein Base 4B GRPO + remote HPSv3 for 2 nodes x 8 x 80 GB.
+# The base model uses an 8-step Flow-SDE rollout and a 28-step evaluation path.
 
 launcher: "accelerate"
 config_file: config/accelerate_configs/fsdp2.yaml
@@ -21,13 +21,13 @@ data:
   dataloader_num_workers: 8
   enable_preprocess: true
   force_reprocess: false
-  cache_dir: "/mnt/aigc/wangyubo/.cache/flow_factory/qwen_image_hpsv3"
+  cache_dir: "/mnt/aigc/wangyubo/.cache/flow_factory/flux2_klein_base_4b_hpsv3"
   preprocess_parallelism: global
   sampler_type: "group_contiguous"
 
 model:
-  model_name_or_path: "/mnt/aigc/zoemodels/Qwen-Image/Qwen-Image"
-  model_type: "qwen-image"
+  model_name_or_path: "/mnt/aigc/shared_env/huggingface/hub/models--black-forest-labs--FLUX.2-klein-base-4B/snapshots/a3b4f4849157f664bdbc776fd7453c2783562f4d"
+  model_type: "flux2-klein"
   finetune_type: "lora"
   lora_rank: 64
   lora_alpha: 128
@@ -37,10 +37,10 @@ model:
   resume_type: null
 
 log:
-  run_name: "qwen_image_hpsv3_grpo_2x8_{timestamp}"
+  run_name: "flux2_klein_base_4b_hpsv3_grpo_2x8_{timestamp}"
   project: "Flow-Factory"
   logging_backend: "wandb"
-  save_dir: "saves/qwen_image_hpsv3_2x8"
+  save_dir: "saves/flux2_klein_base_4b_hpsv3_2x8"
   save_freq: 20
   save_model_only: true
 
@@ -53,8 +53,9 @@ train:
   kl_type: "v-based"
   kl_beta: 0
   ref_param_device: "cuda"
-  resolution: 512
-  num_inference_steps: 10
+  resolution: 384
+  condition_image_size: 384
+  num_inference_steps: 8
   guidance_scale: 4.0
   per_device_batch_size: 1
   group_size: 16
@@ -71,16 +72,17 @@ train:
 
 scheduler:
   dynamics_type: "Flow-SDE"
-  noise_level: 1.0
+  noise_level: 0.7
   num_sde_steps: 1
   sde_steps: [1, 2, 3]
   seed: 42
 
 eval:
   resolution: 1024
+  condition_image_size: 1024
   per_device_batch_size: 1
   guidance_scale: 4.0
-  num_inference_steps: 50
+  num_inference_steps: 28
   eval_freq: 20
   seed: 42
 

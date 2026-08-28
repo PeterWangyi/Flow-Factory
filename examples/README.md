@@ -49,22 +49,21 @@ python scripts/prepare_aesthetics_prompts.py \
   --seed 42
 ```
 
-Use the shared launcher on both nodes. Pass the same model and master address,
-but use rank 0 on the master and rank 1 on the second node:
+Use the shared launcher on both nodes. Pass the same YAML path, but use rank 0
+on the master and rank 1 on the second node:
 
 ```bash
 # Master node
-bash peter_training/test_scripts/launch_hpsv3_2x8.sh qwen-image 0 10.0.0.1
+bash peter_training/test_scripts/launch_hpsv3_2x8.sh examples/grpo/lora/qwen_image/hpsv3_2x8.yaml 0
 
 # Second node
-bash peter_training/test_scripts/launch_hpsv3_2x8.sh qwen-image 1 10.0.0.1
+bash peter_training/test_scripts/launch_hpsv3_2x8.sh examples/grpo/lora/qwen_image/hpsv3_2x8.yaml 1
 ```
 
-Replace `qwen-image` with `flux2`, `z-image`, or `sd3.5` to select another
-recipe. Environment-only invocation is also supported through `FF_MODEL`,
-`MACHINE_RANK`, and `MASTER_ADDR`. Set `FF_LOG_DIR` to change the per-node log
-directory; extra positional arguments after the master address are forwarded to
-`ff-train`.
+Use any other recipe by replacing the YAML path. Environment-only invocation is
+also supported through `FF_CONFIG` and `MACHINE_RANK`. Set `FF_LOG_DIR` to change
+the per-node log directory; extra positional arguments after the machine rank
+are forwarded to `ff-train`.
 
 The dataset path must exist on both nodes. With local preprocessing, the cache
 need not be shared. Before a long run, verify `/healthz` or `/health` and one

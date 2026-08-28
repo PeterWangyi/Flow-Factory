@@ -123,6 +123,8 @@ def test_loader_builds_ddp_handler_before_one_accelerator(
         distributed_type = DistributedType.MULTI_GPU
 
         def __init__(self, **kwargs: object) -> None:
+            self.is_main_process = True
+            self.project_configuration = kwargs["project_config"]
             events.append(("accelerator", kwargs["kwargs_handlers"]))
 
     class FakeTrainer:

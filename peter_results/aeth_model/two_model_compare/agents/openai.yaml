@@ -1,0 +1,4 @@
+interface:
+  display_name: "Flow-Factory Two Model Eval Compare"
+  short_description: "Compare the latest eval images from two Flow-Factory save runs"
+  default_prompt: "Use $flow-factory-two-model-compare to build a static comparison of two Flow-Factory runs."

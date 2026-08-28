@@ -52,6 +52,14 @@ from .training_args import (
 
 logger = setup_logger(__name__, rank_zero_only=True)
 
+_RUN_NAME_TIMESTAMP_TOKEN = "{timestamp}"
+
+
+def _resolve_run_name(run_name: Optional[str], default_prefix: str, timestamp: str) -> str:
+    """Resolve the optional timestamp placeholder in a run name."""
+    template = run_name or f"{default_prefix}_{_RUN_NAME_TIMESTAMP_TOKEN}"
+    return template.replace(_RUN_NAME_TIMESTAMP_TOKEN, timestamp)
+
 
 def _json_safe(obj: Any) -> Any:
     """Recursively coerce a config dict into a JSON-serializable form.
@@ -280,9 +288,17 @@ class Arguments(ArgABC):
             )
 
     def __post_init__(self):
-        if self.log_args.run_name is None:
+        if self.log_args.run_name is None or _RUN_NAME_TIMESTAMP_TOKEN in self.log_args.run_name:
             time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.log_args.run_name = f"{self.model_args.model_type}_{self.model_args.finetune_type}_{self.training_args.trainer_type}_{time_stamp}"
+            default_prefix = (
+                f"{self.model_args.model_type}_{self.model_args.finetune_type}_"
+                f"{self.training_args.trainer_type}"
+            )
+            self.log_args.run_name = _resolve_run_name(
+                self.log_args.run_name,
+                default_prefix,
+                time_stamp,
+            )
 
         self._synthesize_default_optimizer_args()
         self._validate_dataset_routing()
