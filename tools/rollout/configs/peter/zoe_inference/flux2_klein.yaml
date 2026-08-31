@@ -1,0 +1,27 @@
+version: 1
+
+model:
+  type: flux2-klein
+  path: /mnt/aigc/shared_env/huggingface/hub/models--black-forest-labs--FLUX.2-klein-base-4B/snapshots/a3b4f4849157f664bdbc776fd7453c2783562f4d
+  checkpoint: saves/flux2_klein_base_4b_hpsv3_2x8/flux2_klein_base_4b_hpsv3_grpo_2x8/checkpoints/checkpoint-180
+
+data:
+  input: peter_data/dataset/peter_use/task_20260817/visual_eval_3task_all.jsonl
+  prompt_key: prompt
+  raw_prompt: false
+  start_index: 0
+  limit: null
+
+output_dir: peter_results/rollout/zoe_inference/flux2_klein_checkpoint_180
+
+launcher:
+  gpus: [0]
+  cpu_offload: true
+
+sampling:
+  resolution: 1024
+  num_steps: 28
+  guidance_scale: 4.0
+  seed: 42
+
+overwrite: false

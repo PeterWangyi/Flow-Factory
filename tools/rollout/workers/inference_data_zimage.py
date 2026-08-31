@@ -13,13 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generate Qwen-Image images from a JSONL prompt file."""
+"""Generate Z-Image images from a JSONL prompt file."""
 
 import argparse
 
 import torch
-from diffusers import QwenImagePipeline
-
 from _common import (
     add_common_arguments,
     attach_lora,
@@ -28,24 +26,25 @@ from _common import (
     write_batch_outputs,
 )
 
+from diffusers import ZImagePipeline
 
-DEFAULT_MODEL_PATH = "/mnt/aigc/zoemodels/Qwen-Image/Qwen-Image"
+DEFAULT_MODEL_PATH = "/mnt/aigc/zoemodels/Z-Image/Z-Image"
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse Qwen-Image batch-inference arguments."""
+    """Parse Z-Image batch-inference arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
     add_common_arguments(
         parser,
         default_model_path=DEFAULT_MODEL_PATH,
-        default_num_inference_steps=50,
+        default_num_inference_steps=40,
     )
-    parser.add_argument("--negative_prompt", "--negative-prompt", default=" ")
+    parser.add_argument("--negative_prompt", "--negative-prompt", default="")
     return parser.parse_args()
 
 
 def main() -> None:
-    """Load Qwen-Image once and generate all selected prompts."""
+    """Load Z-Image once and generate all selected prompts."""
     args = parse_args()
     records = load_prompt_records(
         args.prompt_file,
@@ -60,7 +59,7 @@ def main() -> None:
         overwrite=args.overwrite,
     )
 
-    pipe = QwenImagePipeline.from_pretrained(
+    pipe = ZImagePipeline.from_pretrained(
         args.model_path,
         dtype=torch.bfloat16,
         low_cpu_mem_usage=False,
@@ -77,15 +76,16 @@ def main() -> None:
             negative_prompt=args.negative_prompt,
             height=args.height,
             width=args.width,
+            cfg_normalization=False,
             num_inference_steps=args.num_inference_steps,
-            true_cfg_scale=args.guidance_scale,
+            guidance_scale=args.guidance_scale,
             generator=torch.Generator(device="cuda").manual_seed(seed),
         ).images[0]
 
     write_batch_outputs(
         records,
         args=args,
-        model_name="QwenImagePipeline",
+        model_name="ZImagePipeline",
         generate_image=generate_image,
         metadata_path=metadata_path,
     )

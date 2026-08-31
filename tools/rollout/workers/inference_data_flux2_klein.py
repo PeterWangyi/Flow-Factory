@@ -13,13 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generate Z-Image images from a JSONL prompt file."""
+"""Generate FLUX.2 Klein images from a JSONL prompt file."""
 
 import argparse
 
 import torch
-from diffusers import ZImagePipeline
-
 from _common import (
     add_common_arguments,
     attach_lora,
@@ -28,24 +26,28 @@ from _common import (
     write_batch_outputs,
 )
 
+from diffusers import Flux2KleinPipeline
 
-DEFAULT_MODEL_PATH = "/mnt/aigc/zoemodels/Z-Image/Z-Image"
+DEFAULT_MODEL_PATH = (
+    "/mnt/aigc/shared_env/huggingface/hub/"
+    "models--black-forest-labs--FLUX.2-klein-base-4B/snapshots/"
+    "a3b4f4849157f664bdbc776fd7453c2783562f4d"
+)
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse Z-Image batch-inference arguments."""
+    """Parse FLUX.2 Klein batch-inference arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
     add_common_arguments(
         parser,
         default_model_path=DEFAULT_MODEL_PATH,
-        default_num_inference_steps=40,
+        default_num_inference_steps=28,
     )
-    parser.add_argument("--negative_prompt", "--negative-prompt", default="")
     return parser.parse_args()
 
 
 def main() -> None:
-    """Load Z-Image once and generate all selected prompts."""
+    """Load FLUX.2 Klein once and generate all selected prompts."""
     args = parse_args()
     records = load_prompt_records(
         args.prompt_file,
@@ -60,7 +62,7 @@ def main() -> None:
         overwrite=args.overwrite,
     )
 
-    pipe = ZImagePipeline.from_pretrained(
+    pipe = Flux2KleinPipeline.from_pretrained(
         args.model_path,
         dtype=torch.bfloat16,
         low_cpu_mem_usage=False,
@@ -74,19 +76,17 @@ def main() -> None:
     def generate_image(prompt: str, seed: int):
         return pipe(
             prompt=prompt,
-            negative_prompt=args.negative_prompt,
             height=args.height,
             width=args.width,
-            cfg_normalization=False,
-            num_inference_steps=args.num_inference_steps,
             guidance_scale=args.guidance_scale,
+            num_inference_steps=args.num_inference_steps,
             generator=torch.Generator(device="cuda").manual_seed(seed),
         ).images[0]
 
     write_batch_outputs(
         records,
         args=args,
-        model_name="ZImagePipeline",
+        model_name="Flux2KleinPipeline",
         generate_image=generate_image,
         metadata_path=metadata_path,
     )

@@ -1,0 +1,28 @@
+version: 1
+
+model:
+  type: qwen-image
+  path: /mnt/aigc/zoemodels/Qwen-Image/Qwen-Image
+  checkpoint: saves/qwen_image_hpsv3_2x8/qwen_image_hpsv3_grpo_2x8/checkpoints/checkpoint-180
+
+data:
+  input: peter_data/dataset/peter_use/task_20260817/visual_eval_3task_all.jsonl
+  prompt_key: prompt
+  raw_prompt: false
+  start_index: 0
+  limit: null
+
+output_dir: peter_results/rollout/zoe_inference/qwen_image_checkpoint_180
+
+launcher:
+  gpus: [0]
+  cpu_offload: true
+
+sampling:
+  resolution: 1024
+  num_steps: 50
+  guidance_scale: 4.0
+  negative_prompt: " "
+  seed: 42
+
+overwrite: false

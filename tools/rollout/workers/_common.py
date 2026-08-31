@@ -113,9 +113,7 @@ def load_prompt_records(
             if not isinstance(record, dict):
                 raise ValueError(f"{prompt_file}:{line_number}: record must be a JSON object")
             if prompt_key not in record:
-                raise ValueError(
-                    f"{prompt_file}:{line_number}: record has no {prompt_key!r} field"
-                )
+                raise ValueError(f"{prompt_file}:{line_number}: record has no {prompt_key!r} field")
 
             if record_index >= start_index:
                 prompt = normalize_prompt(
@@ -243,8 +241,7 @@ def validate_output_targets(
         if metadata_path.exists():
             examples.insert(0, str(metadata_path))
         raise FileExistsError(
-            "Output targets already exist; pass --overwrite to replace them: "
-            + ", ".join(examples)
+            "Output targets already exist; pass --overwrite to replace them: " + ", ".join(examples)
         )
     return metadata_path
 
@@ -263,12 +260,12 @@ def write_batch_outputs(
         records: Selected prompt records.
         args: Shared parsed CLI arguments.
         model_name: Human-readable pipeline identifier.
-        generate_image: Callable accepting prompt and per-record seed.
+        generate_image: Callable accepting prompt and the configured seed.
         metadata_path: Destination metadata JSONL file.
     """
     with metadata_path.open("w", encoding="utf-8") as metadata_file:
         for position, record in enumerate(records, start=1):
-            image_seed = args.seed + record.index
+            image_seed = args.seed
             image = generate_image(record.prompt, image_seed)
             image_name = f"{record.index:06d}.png"
             image_path = args.output_dir / image_name
