@@ -1,0 +1,10 @@
+[
+  {
+    "tag": "021_realism",
+    "model_path": "/mnt/aigc/linzhiqian/model_exports/hpsv3_v021_realism/merged/HPSv3_v0.2.1_realism_merged.safetensors"
+  },
+  {
+    "tag": "022_overall",
+    "model_path": "/mnt/aigc/linzhiqian/model_exports/hpsv3_v022_overall/merged/HPSv3_v0.2.2_overall_merged.safetensors"
+  }
+]
