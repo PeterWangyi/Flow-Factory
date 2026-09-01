@@ -21,11 +21,16 @@
 ]
 ```
 
-tag 的最后一段决定 instruction：`021_realism` 对应 `REALISM_INSTRUCTION`，`022_overall` 对应 `OVERALL_INSTRUCTION`。以后新增 `023_aesthetic` 时，只需在 `zhiqian_model_sysprompt.py` 增加：
+tag 的最后一段决定 instruction：`021_realism` 对应 `DIMENSION_INSTRUCTIONS["realism"]`，`022_overall` 对应 `DIMENSION_INSTRUCTIONS["overall"]`。以后新增 `023_aesthetic` 时，只需在 `zhiqian_model_sysprompt.py` 的字典中增加：
 
 ```python
-AESTHETIC_INSTRUCTION = "..."
+DIMENSION_INSTRUCTIONS = {
+    # existing dimensions...
+    "aesthetic": "...",
+}
 ```
+
+字典 key 匹配时不区分大小写。例如 `textCorrectness` 会被规范化为 `textcorrectness`，因此 tag `023_textCorrectness` 可以正常匹配。
 
 查看模型：
 

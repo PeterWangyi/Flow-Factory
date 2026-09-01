@@ -4,7 +4,31 @@
     "model_path": "/mnt/aigc/linzhiqian/model_exports/hpsv3_v021_realism/merged/HPSv3_v0.2.1_realism_merged.safetensors"
   },
   {
+    "tag": "022_color",
+    "model_path": "/mnt/aigc/linzhiqian/model_exports/hpsv3_v022_color/merged/HPSv3_v0.2.2_color_merged.safetensors"
+  },
+  {
+    "tag": "022_composition",
+    "model_path": "/mnt/aigc/linzhiqian/model_exports/hpsv3_v022_composition/merged/HPSv3_v0.2.2_composition_merged.safetensors"
+  },
+  {
+    "tag": "022_creativity",
+    "model_path": "/mnt/aigc/linzhiqian/model_exports/hpsv3_v022_creativity/merged/HPSv3_v0.2.2_creativity_merged.safetensors"
+  },
+  {
+    "tag": "022_lighting",
+    "model_path": "/mnt/aigc/linzhiqian/model_exports/hpsv3_v022_lighting/merged/HPSv3_v0.2.2_lighting_merged.safetensors"
+  },
+  {
+    "tag": "022_mood",
+    "model_path": "/mnt/aigc/linzhiqian/model_exports/hpsv3_v022_mood/merged/HPSv3_v0.2.2_mood_merged.safetensors"
+  },
+  {
     "tag": "022_overall",
     "model_path": "/mnt/aigc/linzhiqian/model_exports/hpsv3_v022_overall/merged/HPSv3_v0.2.2_overall_merged.safetensors"
+  },
+  {
+    "tag": "022_textCorrectness",
+    "model_path": "/mnt/aigc/linzhiqian/model_exports/hpsv3_v022_textCorrectness/merged/HPSv3_v0.2.2_textCorrectness_merged.safetensors"
   }
 ]

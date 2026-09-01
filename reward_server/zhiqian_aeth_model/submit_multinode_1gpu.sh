@@ -105,22 +105,32 @@ AEC2_NAME="m-train-neo2-infographic"
 # AEC2_NAME="umm"
 
 ### job name
-# JOB_NAME="neo_infog_hps_rl"
-# JOB_NAME="neo_infog_eval"
 JOB_NAME="U15-AethModel"
-# JOB_NAME="U1-InfoV3_DPO"
 
 ### storage mount
 STORAGE_MOUNT="1f29056c-c3f2-11ee-967e-2aea81fd34ba:/mnt/afs2,047443d2-c3f2-11ee-a5f9-9e29792dec2f:/mnt/afs1,ce3b1174-f6eb-11ee-a372-82d352e10aed:/mnt/afs,c83d08bc-2965-11ef-b8c5-929f74fd8884:/mnt/aigc/,01998fb1-b876-7b33-82c9-4427517bf536:/mnt/umm"
 
 ### worker spec
-WORKER_NODES=2
+WORKER_NODES=1
 WORKER_SPEC="N6lS.Iu.I80.1"  # default
 # WORKER_SPEC="N6lS.Iq.I10.1"  # vigen si
 
 # bash server/zhiqian_aeth_model/submit_multinode_1gpu.sh --tag 021 --model realism
-  # --nodes 4 \
-  # --dry-run
+
+# bash server/zhiqian_aeth_model/submit_multinode_1gpu.sh --tag 022 --model overall
+
+# bash server/zhiqian_aeth_model/submit_multinode_1gpu.sh --tag 022 --model color
+
+# bash server/zhiqian_aeth_model/submit_multinode_1gpu.sh --tag 022 --model composition
+
+# bash server/zhiqian_aeth_model/submit_multinode_1gpu.sh --tag 022 --model creativity
+
+# bash server/zhiqian_aeth_model/submit_multinode_1gpu.sh --tag 022 --model lighting
+
+# bash server/zhiqian_aeth_model/submit_multinode_1gpu.sh --tag 022 --model mood
+
+# bash server/zhiqian_aeth_model/submit_multinode_1gpu.sh --tag 022 --model textCorrectness
+
 
 HPSV3_REPO="${HPSV3_REPO:-/mnt/aigc/wangyubo/code/IG/neo/RL/HPSv3}"
 HPSV3_ENV="${HPSV3_ENV:-/mnt/aigc/wangyubo/anaconda3/envs/hpsv3}"
