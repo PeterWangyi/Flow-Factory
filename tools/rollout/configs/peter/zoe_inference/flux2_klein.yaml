@@ -23,5 +23,6 @@ sampling:
   num_steps: 28
   guidance_scale: 4.0
   seed: 42
+  num_images_per_prompt: 1
 
 overwrite: false

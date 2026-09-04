@@ -6,7 +6,7 @@ model:
   checkpoint: /mnt/aigc/wangyubo/code/IG/neo/RL/Flow-Factory/saves/z_image_hpsv3_2x8/[Z-Image]-D-u15-filter04-R-hpsv3-20260828_195751/checkpoints/checkpoint-180
 
 data:
-  input: peter_data/dataset/peter_use/task_20260817/visual_eval_3task_all.jsonl
+  input: /mnt/aigc/wangyubo/code/IG/neo/RL/Flow-Factory/peter_data/dataset/peter_use/task_20260817/visual_eval_3task_all.jsonl
   prompt_key: prompt
   raw_prompt: false
   start_index: 0
@@ -24,5 +24,6 @@ sampling:
   guidance_scale: 4.0
   negative_prompt: ""
   seed: 42
+  num_images_per_prompt: 1
 
 overwrite: false

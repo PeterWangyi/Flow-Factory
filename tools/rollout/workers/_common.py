@@ -21,9 +21,10 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import torch
+import torch.multiprocessing as mp
 from peft import PeftModel
 
 
@@ -34,6 +35,117 @@ class PromptRecord:
     index: int
     line_number: int
     prompt: str
+
+
+@dataclass(frozen=True)
+class ImageTask:
+    """Represent one prompt/sample image generation task."""
+
+    record: PromptRecord
+    sample_index: int
+    seed: int
+    image_name: str
+
+
+def build_image_tasks(
+    records: Sequence[PromptRecord],
+    *,
+    num_images_per_prompt: int,
+    base_seed: int,
+) -> List[ImageTask]:
+    """Expand prompt records into deterministic image tasks.
+
+    Args:
+        records: Prompt records selected for generation.
+        num_images_per_prompt: Number of images to generate for each prompt.
+        base_seed: Seed used for the first sample of every prompt.
+
+    Returns:
+        Prompt/sample tasks in deterministic prompt-major order.
+    """
+    if num_images_per_prompt < 1:
+        raise ValueError("num_images_per_prompt must be a positive integer")
+
+    tasks: List[ImageTask] = []
+    for record in records:
+        for sample_index in range(num_images_per_prompt):
+            if num_images_per_prompt == 1:
+                image_name = f"{record.index:06d}.png"
+            else:
+                image_name = f"{record.index:06d}_{sample_index:03d}.png"
+            tasks.append(
+                ImageTask(
+                    record=record,
+                    sample_index=sample_index,
+                    seed=base_seed + sample_index,
+                    image_name=image_name,
+                )
+            )
+    return tasks
+
+
+def shard_image_tasks(
+    tasks: Sequence[ImageTask],
+    *,
+    rank: int,
+    world_size: int,
+) -> List[ImageTask]:
+    """Select one interleaved task shard for a worker rank.
+
+    Args:
+        tasks: Expanded image tasks.
+        rank: Zero-based logical worker rank.
+        world_size: Total number of worker ranks.
+
+    Returns:
+        Tasks whose flattened positions belong to the requested rank.
+    """
+    if world_size < 1:
+        raise ValueError("world_size must be a positive integer")
+    if rank < 0 or rank >= world_size:
+        raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
+    return [task for position, task in enumerate(tasks) if position % world_size == rank]
+
+
+def merge_metadata_shards(shard_paths: Sequence[Path], metadata_path: Path) -> None:
+    """Merge rank metadata files into deterministic prompt/sample order.
+
+    Args:
+        shard_paths: Rank-specific metadata JSONL files.
+        metadata_path: Final merged metadata JSONL destination.
+    """
+    records: List[Dict[str, Any]] = []
+    for shard_path in shard_paths:
+        with shard_path.open("r", encoding="utf-8") as shard_file:
+            for line_number, line in enumerate(shard_file, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise ValueError(
+                        f"{shard_path}:{line_number}: invalid metadata JSON: {error}"
+                    ) from error
+                if not isinstance(record, dict):
+                    raise ValueError(
+                        f"{shard_path}:{line_number}: metadata record must be a JSON object"
+                    )
+                records.append(record)
+
+    records.sort(key=lambda record: (record["index"], record["sample_index"]))
+    temporary_path = metadata_path.with_name(f".{metadata_path.name}.tmp")
+    temporary_path.unlink(missing_ok=True)
+    try:
+        with temporary_path.open("w", encoding="utf-8") as metadata_file:
+            for record in records:
+                metadata_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        temporary_path.replace(metadata_path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+    for shard_path in shard_paths:
+        shard_path.unlink()
 
 
 def normalize_prompt(value: object, *, source: Path, line_number: int, raw: bool) -> str:
@@ -168,8 +280,59 @@ def add_common_arguments(
     )
     parser.add_argument("--guidance_scale", "--guidance-scale", type=float, default=4.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_gpus", "--num-gpus", type=int, default=1)
+    parser.add_argument("--gpu_ids", "--gpu-ids")
+    parser.add_argument(
+        "--num_images_per_prompt",
+        "--num-images-per-prompt",
+        type=int,
+        default=1,
+    )
     parser.add_argument("--no_cpu_offload", "--no-cpu-offload", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+
+
+def resolve_physical_gpu_ids(args: argparse.Namespace) -> List[int]:
+    """Validate worker GPU arguments and return physical device indices.
+
+    Args:
+        args: Parsed worker arguments containing ``num_gpus`` and ``gpu_ids``.
+
+    Returns:
+        Ordered physical GPU indices corresponding to logical worker ranks.
+    """
+    if args.num_gpus < 1:
+        raise ValueError("--num-gpus must be a positive integer")
+    if args.gpu_ids is None:
+        gpu_ids = list(range(args.num_gpus))
+    else:
+        try:
+            gpu_ids = [int(item.strip()) for item in args.gpu_ids.split(",")]
+        except ValueError as error:
+            raise ValueError("--gpu-ids must be a comma-separated list of integers") from error
+    if len(gpu_ids) != args.num_gpus:
+        raise ValueError(
+            f"--gpu-ids contains {len(gpu_ids)} devices but --num-gpus is {args.num_gpus}"
+        )
+    if any(gpu_id < 0 for gpu_id in gpu_ids):
+        raise ValueError("--gpu-ids must contain nonnegative integers")
+    if len(set(gpu_ids)) != len(gpu_ids):
+        raise ValueError("--gpu-ids must not contain duplicates")
+    return gpu_ids
+
+
+def configure_pipeline_device(pipe: Any, *, cpu_offload: bool, rank: int) -> None:
+    """Place one pipeline on the logical CUDA device owned by a worker rank.
+
+    Args:
+        pipe: Diffusers pipeline to place or configure for CPU offload.
+        cpu_offload: Whether to enable model CPU offload.
+        rank: Logical CUDA device index owned by the worker.
+    """
+    if cpu_offload:
+        pipe.enable_model_cpu_offload(gpu_id=rank)
+    else:
+        pipe.to(f"cuda:{rank}")
 
 
 def attach_lora(pipe: Any, lora_path: Optional[Path]) -> bool:
@@ -215,7 +378,7 @@ def attach_lora(pipe: Any, lora_path: Optional[Path]) -> bool:
 
 def validate_output_targets(
     output_dir: Path,
-    records: List[PromptRecord],
+    tasks: Sequence[ImageTask],
     *,
     overwrite: bool,
 ) -> Path:
@@ -223,7 +386,7 @@ def validate_output_targets(
 
     Args:
         output_dir: Destination directory.
-        records: Selected records defining deterministic image names.
+        tasks: Expanded tasks defining deterministic image names.
         overwrite: Whether existing outputs may be replaced.
 
     Returns:
@@ -234,7 +397,7 @@ def validate_output_targets(
     if overwrite:
         return metadata_path
 
-    existing = [output_dir / f"{record.index:06d}.png" for record in records]
+    existing = [output_dir / task.image_name for task in tasks]
     existing = [path for path in existing if path.exists()]
     if metadata_path.exists() or existing:
         examples = [str(path) for path in existing[:3]]
@@ -247,36 +410,38 @@ def validate_output_targets(
 
 
 def write_batch_outputs(
-    records: List[PromptRecord],
+    tasks: Sequence[ImageTask],
     *,
     args: argparse.Namespace,
     model_name: str,
     generate_image: Callable[[str, int], Any],
     metadata_path: Path,
+    physical_gpu: int,
 ) -> None:
-    """Generate, save, and journal one image per prompt record.
+    """Generate, save, and journal one worker's image tasks.
 
     Args:
-        records: Selected prompt records.
+        tasks: Image tasks assigned to the current worker.
         args: Shared parsed CLI arguments.
         model_name: Human-readable pipeline identifier.
         generate_image: Callable accepting prompt and the configured seed.
         metadata_path: Destination metadata JSONL file.
+        physical_gpu: Physical GPU index exposed to the worker rank.
     """
     with metadata_path.open("w", encoding="utf-8") as metadata_file:
-        for position, record in enumerate(records, start=1):
-            image_seed = args.seed
-            image = generate_image(record.prompt, image_seed)
-            image_name = f"{record.index:06d}.png"
-            image_path = args.output_dir / image_name
+        for position, task in enumerate(tasks, start=1):
+            image = generate_image(task.record.prompt, task.seed)
+            image_path = args.output_dir / task.image_name
             image.save(image_path)
 
             metadata: Dict[str, Any] = {
-                "index": record.index,
-                "source_line": record.line_number,
-                "prompt": record.prompt,
-                "seed": image_seed,
-                "image": image_name,
+                "index": task.record.index,
+                "source_line": task.record.line_number,
+                "prompt": task.record.prompt,
+                "sample_index": task.sample_index,
+                "seed": task.seed,
+                "image": task.image_name,
+                "gpu": physical_gpu,
                 "model": model_name,
                 "model_path": str(args.model_path),
                 "lora_path": str(args.lora_path) if args.lora_path is not None else None,
@@ -287,6 +452,59 @@ def write_batch_outputs(
             }
             metadata_file.write(json.dumps(metadata, ensure_ascii=False) + "\n")
             metadata_file.flush()
-            print(f"[{position}/{len(records)}] saved {image_path}")
+            print(f"[{position}/{len(tasks)}] saved {image_path}")
 
     print(f"Saved metadata to {metadata_path}")
+
+
+def metadata_shard_path(output_dir: Path, rank: int) -> Path:
+    """Return the temporary metadata path for one worker rank.
+
+    Args:
+        output_dir: Rollout output directory.
+        rank: Zero-based logical worker rank.
+
+    Returns:
+        Rank-specific metadata JSONL path.
+    """
+    return output_dir / f"metadata.rank-{rank}.jsonl"
+
+
+def run_image_workers(
+    worker: Callable[[int, int, argparse.Namespace, List[ImageTask]], None],
+    *,
+    args: argparse.Namespace,
+    tasks: Sequence[ImageTask],
+    metadata_path: Path,
+) -> None:
+    """Run one model replica per GPU and merge successful rank metadata.
+
+    Args:
+        worker: Top-level rank worker callable compatible with ``mp.spawn``.
+        args: Parsed worker arguments.
+        tasks: Expanded image tasks shared with every worker for static sharding.
+        metadata_path: Final merged metadata JSONL destination.
+    """
+    resolve_physical_gpu_ids(args)
+    shard_paths = [metadata_shard_path(args.output_dir, rank) for rank in range(args.num_gpus)]
+    temporary_path = metadata_path.with_name(f".{metadata_path.name}.tmp")
+    metadata_path.unlink(missing_ok=True)
+    temporary_path.unlink(missing_ok=True)
+    for shard_path in shard_paths:
+        shard_path.unlink(missing_ok=True)
+
+    image_tasks = list(tasks)
+    if args.num_gpus == 1:
+        worker(0, 1, args, image_tasks)
+    else:
+        mp.spawn(
+            worker,
+            args=(args.num_gpus, args, image_tasks),
+            nprocs=args.num_gpus,
+            join=True,
+        )
+
+    missing = [str(path) for path in shard_paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError("Worker metadata shard was not created: " + ", ".join(missing))
+    merge_metadata_shards(shard_paths, metadata_path)
