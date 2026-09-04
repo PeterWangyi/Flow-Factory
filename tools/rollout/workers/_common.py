@@ -130,6 +130,13 @@ def merge_metadata_shards(shard_paths: Sequence[Path], metadata_path: Path) -> N
                     raise ValueError(
                         f"{shard_path}:{line_number}: metadata record must be a JSON object"
                     )
+                for field_name in ("index", "sample_index"):
+                    field_value = record.get(field_name)
+                    if type(field_value) is not int:
+                        raise ValueError(
+                            f"{shard_path}:{line_number}: metadata field "
+                            f"{field_name!r} must be an integer"
+                        )
                 records.append(record)
 
     records.sort(key=lambda record: (record["index"], record["sample_index"]))
