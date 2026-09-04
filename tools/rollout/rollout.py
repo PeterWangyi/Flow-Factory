@@ -68,6 +68,7 @@ SAMPLING_KEYS = {
     "guidance_scale",
     "seed",
     "negative_prompt",
+    "num_images_per_prompt",
 }
 
 
@@ -285,7 +286,7 @@ def _resolution(value: Any) -> List[int]:
 
 
 def _gpus(value: Any) -> List[int]:
-    """Normalize the single supported GPU selection."""
+    """Normalize the configured GPU selection."""
     if value is None:
         items = [0]
     elif type(value) is int:
@@ -296,15 +297,17 @@ def _gpus(value: Any) -> List[int]:
         items = list(value)
     else:
         raise RolloutConfigError("launcher.gpus must be a GPU index, comma list, or list")
+    # Preserve the configured order: it is used both for CUDA visibility and for
+    # mapping worker-local ranks back to the physical GPU identifiers.
     result: List[int] = []
     for index, item in enumerate(items):
         if isinstance(item, str) and item.isdigit():
             item = int(item)
         result.append(_integer(item, f"launcher.gpus[{index}]", minimum=0))
-    if len(result) != 1:
-        raise RolloutConfigError(
-            "launcher.gpus must select exactly one GPU; multi-GPU prompt sharding is not supported"
-        )
+    if not result:
+        raise RolloutConfigError("launcher.gpus must select at least one GPU")
+    if len(set(result)) != len(result):
+        raise RolloutConfigError("launcher.gpus must not contain duplicate GPU indices")
     return result
 
 
@@ -368,6 +371,13 @@ def _validate_and_resolve(job: Dict[str, Any]) -> Dict[str, Any]:
         minimum=0,
     )
     seed = _integer(sampling_raw.get("seed", 42), "sampling.seed", minimum=0)
+    # This count expands every prompt into independent sample tasks. The worker
+    # later assigns those tasks by position, so the seed remains rank-independent.
+    num_images_per_prompt = _integer(
+        sampling_raw.get("num_images_per_prompt", 1),
+        "sampling.num_images_per_prompt",
+        minimum=1,
+    )
     negative_prompt = sampling_raw.get("negative_prompt", spec["negative_prompt"])
     if model_type == "flux2-klein" and negative_prompt is not None:
         raise RolloutConfigError("sampling.negative_prompt is not supported by flux2-klein")
@@ -396,6 +406,7 @@ def _validate_and_resolve(job: Dict[str, Any]) -> Dict[str, Any]:
             "guidance_scale": guidance_scale,
             "seed": seed,
             "negative_prompt": negative_prompt,
+            "num_images_per_prompt": num_images_per_prompt,
         },
         "overwrite": overwrite,
     }
@@ -408,6 +419,8 @@ def _command(config: Dict[str, Any]) -> Tuple[List[str], Dict[str, str]]:
     sampling = config["sampling"]
     height, width = sampling["resolution"]
     worker = WORKER_ROOT / MODEL_SPECS[model["type"]]["worker"]
+    # The worker receives the complete GPU set and creates one full model replica
+    # per rank; no distributed process group or model-parallel state is required.
     command = [
         sys.executable,
         str(worker),
@@ -431,6 +444,12 @@ def _command(config: Dict[str, Any]) -> Tuple[List[str], Dict[str, str]]:
         str(sampling["guidance_scale"]),
         "--seed",
         str(sampling["seed"]),
+        "--num-gpus",
+        str(len(config["launcher"]["gpus"])),
+        "--gpu-ids",
+        ",".join(str(gpu) for gpu in config["launcher"]["gpus"]),
+        "--num-images-per-prompt",
+        str(sampling["num_images_per_prompt"]),
     ]
     if model["checkpoint"] is not None:
         command.extend(["--lora-path", str(_repo_path(model["checkpoint"]))])
@@ -446,13 +465,15 @@ def _command(config: Dict[str, Any]) -> Tuple[List[str], Dict[str, str]]:
         command.extend(["--negative-prompt", sampling["negative_prompt"]])
 
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(config["launcher"]["gpus"][0])
+    # CUDA_VISIBLE_DEVICES remaps the selected physical devices to local ordinals
+    # 0..N-1, which lets each spawned rank select its own visible GPU deterministically.
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu) for gpu in config["launcher"]["gpus"])
     return command, env
 
 
 def _display_command(command: List[str], config: Dict[str, Any]) -> str:
     """Render one copyable shell command."""
-    visible_gpu = str(config["launcher"]["gpus"][0])
+    visible_gpu = ",".join(str(gpu) for gpu in config["launcher"]["gpus"])
     return f"CUDA_VISIBLE_DEVICES={shlex.quote(visible_gpu)} {shlex.join(command)}"
 
 
