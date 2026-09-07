@@ -12,6 +12,7 @@
   - [Step 5: Implement `inference()`](#step-5-implement-inference)
   - [Step 6: Implement `forward()`](#step-6-implement-forward)
   - [Step 7: Register the Adapter](#step-7-register-the-adapter)
+- [Advanced: Offline Output-State Encoding](#advanced-offline-output-state-encoding)
 - [Advanced: Custom `preprocess_func`](#advanced-custom-preprocess_func)
 - [Advanced: Pseudo-Pipeline for Non-Diffusers Models](#advanced-pseudo-pipeline-for-non-diffusers-models)
 - [Data Format Conventions](#data-format-conventions)
@@ -19,7 +20,7 @@
 
 ## Overview
 
-Flow-Factory uses a **model adapter** pattern that wraps [diffusers](https://github.com/huggingface/diffusers) pipelines into a unified interface for RL training. Each adapter maps a diffusers pipeline to a consistent API that the training loop can call without knowing model-specific details.
+Flow-Factory uses a **model adapter** pattern that wraps [diffusers](https://github.com/huggingface/diffusers) pipelines into a unified interface for online and offline fine-tuning. Each adapter maps a diffusers pipeline to a consistent API that the training loop can call without knowing model-specific details.
 
 The relationship is straightforward:
 
@@ -58,6 +59,25 @@ The adapter's `inference()` method corresponds to the pipeline's `__call__()`, w
 | **Gradient checkpointing** | Automatic enablement on transformer components |
 
 Your adapter only needs to implement the model-specific logic: **how to encode inputs, how to run inference, and how to perform a single denoising step**.
+
+### Gradient checkpointing contract
+
+`train.enable_gradient_checkpointing` accepts the existing boolean or a selective
+policy such as `{mode: fraction, fraction: 0.25}`, `{every_n: 4}`, or
+`{layers: [0, 4, 8]}`. Selective policies discover ordered blocks from a
+Diffusers model's `_repeated_blocks` declaration. Adapters with multiple forward
+stacks should override `_gradient_checkpointing_units()` and return their blocks
+in execution order.
+
+Checkpointing has one owner. Before model loading, an FSDP2 full model policy is
+normalized to backend activation checkpointing, even when backend checkpointing
+was not explicitly enabled, so recomputation stays inside the sharded
+mixed-precision boundary. FSDP1 keeps model-level ownership. FSDP2 rejects every
+selective train-level policy because model-level `fraction`, `every_n`, or
+`layers` boundaries sit outside the FSDP2 input-cast boundary and cannot replay
+it safely. Transformers-style components support full checkpointing through
+`gradient_checkpointing_enable()`, but must expose the Diffusers callback API to
+support selective modes on compatible backends.
 
 ## Step-by-Step Implementation
 
@@ -98,11 +118,11 @@ class MyModelSample(T2ISample):
 | `I2AVSample` | Image-to-audio-video | `ImageConditionSample` subclass |
 | `V2VSample` | Video-to-video | `VideoConditionSample` subclass |
 
-> See [`src/flow_factory/samples/samples.py`](src/flow_factory/samples/samples.py) for all available classes.
+> See [`src/flow_factory/samples/samples.py`](../src/flow_factory/samples/samples.py) for all available classes.
 
 > **Key**: The `_shared_fields` class variable declares fields that are identical across a batch (e.g., `height`, `width`, `latent_index_map`). During `BaseSample.stack()`, shared fields take the first element instead of stacking.
 
-> **Type determinism for `gather_samples`**: `ImageConditionSample.__post_init__` and `VideoConditionSample.__post_init__` canonicalize to a deterministic per-sample type across all samples and ranks — `List[Tensor]` by default, or `List[PIL.Image]` / `List[List[PIL.Image]]` when the subclass sets `condition_images_as_pil` / `condition_videos_as_pil` (adapters that persist condition media as PIL via `python_format_columns`, e.g. Bagel). When defining custom sample fields that will be gathered across ranks (via `gather_samples`), ensure each field has a **consistent type** on every sample — mixing `Tensor` on some samples and `List[Tensor]` on others will cause `gather_samples` to fall through to slow pickle-based `gather_object`. Prefer `List[Tensor]` for variable-length sequences.
+> **Type determinism for `gather_samples`**: `ImageConditionSample.__post_init__` and `VideoConditionSample.__post_init__` canonicalize to a deterministic per-sample type across all samples and ranks — `List[Tensor]` by default, or `List[PIL.Image]` / `List[List[PIL.Image]]` when the subclass sets `condition_images_as_pil` / `condition_videos_as_pil` (adapters that persist condition media as PIL via `python_format_columns`, e.g. Bagel and SenseNova). When defining custom sample fields that will be gathered across ranks (via `gather_samples`), ensure each field has a **consistent type** on every sample — mixing `Tensor` on some samples and `List[Tensor]` on others will cause `gather_samples` to fall through to slow pickle-based `gather_object`. Prefer `List[Tensor]` for variable-length sequences.
 
 
 ### Step 2: Create Adapter Class
@@ -176,7 +196,7 @@ class MyModelAdapter(BaseAdapter):
 | `preprocessing_modules` | `['text_encoders', 'vae']` |
 | `inference_modules` | `['transformer', 'vae']` |
 
-Override only when your model deviates — for example, [WAN-T2V](src/flow_factory/models/wan/wan2_t2v.py) models need `['text_encoders', 'vae', 'image_encoder']` for preprocessing and conditionally include `transformer_2` for inference.
+Override only when your model deviates — for example, [WAN-T2V](../src/flow_factory/models/wan/wan2_t2v.py) models need `['text_encoders', 'vae', 'image_encoder']` for preprocessing and conditionally include `transformer_2` for inference.
 
 > **Tip**: Use `print(dict(self.pipeline.named_children()))` to discover available component names.
 
@@ -201,7 +221,12 @@ preprocess_func(prompt, images, videos, audios, **kwargs):
     return results
 ```
 
-Text-to-image models override only `encode_prompt` and `encode_image`; image-to-video models add `encode_video`; audio-conditioned models add `encode_audio`. There is no need to add stub `pass` overrides for unused modalities — `BaseAdapter` already provides them.
+Text-to-image, text-to-video, and text-to-audio-video adapters usually override only
+`encode_prompt` because they have no condition media. Image-conditioned tasks add
+`encode_image`; video-conditioned tasks add `encode_video`; audio-conditioned tasks add
+`encode_audio`. These functions encode inputs, not supervised outputs—offline targets belong to
+the output-state codec. There is no need to add stub `pass` overrides for unused modalities;
+`BaseAdapter` already provides them.
 
 #### `encode_prompt`
 
@@ -255,7 +280,7 @@ def encode_image(
     """
 ```
 
-> **Important**: The `images` input follows the **multi-image batch** convention: `List[List[Image.Image]]`. Each sample can have zero, one, or multiple condition images. See [Data Format Conventions](#data-format-conventions) for details. Adapters that persist a returned image column as PIL (declare it in `python_format_columns`, e.g. Bagel's `condition_images`) may keep it as PIL; the dataset stores those columns via the HF Image feature and reads them back as PIL.
+> **Important**: The `images` input follows the **multi-image batch** convention: `List[List[Image.Image]]`. Each sample can have zero, one, or multiple condition images. See [Data Format Conventions](#data-format-conventions) for details. Adapters that persist a returned image column as PIL (declare it in `python_format_columns`, e.g. Bagel and SenseNova `condition_images`) may keep it as PIL; the dataset stores those columns via the HF Image feature and reads them back as PIL.
 
 #### `encode_video`
 
@@ -531,6 +556,86 @@ model:
   model_name_or_path: "org/my-model-checkpoint"
 ```
 
+## Advanced: Offline Output-State Encoding
+
+Online-only adapters can keep the default `build_output_state_codec() -> None`. To support SFT or
+offline DPO, an adapter must additionally declare both sides of its pipeline and provide an
+on-the-fly output codec:
+
+1. Set a class-level `pipeline_io_contract`. It owns per-type and aggregate input counts,
+   order/binding, optional semantic input slots, negative prompt policy, the exact ordered output
+   media sequence, rate requirements, geometry source, and batch capability. Explicit V2 slots
+   reserve declared arguments; unslotted inputs fill the remaining slots in declaration order, and
+   output media must never carry slots. If checkpoints behind one adapter expose narrower behavior, override
+   `_resolve_pipeline_io_contract()` and return an immutable instance-specific specialization;
+   offline data validation consumes `effective_pipeline_io_contract`.
+2. If cached input fields are not already the exact forward condition, override
+   `build_condition_state_preparer()` with a declaration-only preparer. Its
+   `required_components` lists runtime encoders and `prepare_condition_state()` returns one
+   `PreparedConditionState` per batch. Put input-owned model fields in `forward_context` and
+   input-owned target-binding fields in `output_context`. The two runtime consumer views may
+   intentionally share an input-owned tensor (for example a mask or layout), but each merged
+   consumer view must remain collision-free with cached fields and later candidate-owned output
+   fields.
+3. Override `build_output_state_codec()` with a declaration-only codec. Its
+   `required_components` names logical runtime components such as `("vae",)`; construction must
+   not load, materialize, move, replace, or cast them.
+4. Return an `EncodedOutputState` containing a detached `LatentState`, output-derived forward and
+   decode contexts, and one exact geometry signature per sample.
+5. Override `_validate_encoded_output_geometry()` so configured, condition-derived, and
+   output-derived dimensions cannot drift silently.
+6. Declare a complete immutable `offline_training_forward_overrides` mapping whenever the base
+   `{"guidance_scale": 1.0}` contract does not describe the adapter. Offline trainers apply this
+   mapping after sampling configuration and cached batch conditions, so it owns loss-time model
+   conditioning. Conventional CFG branches must all be set to their neutral point (for example,
+   both Wan transformer scales or Bagel text/image CFG scales); guidance-distilled models instead
+   declare the explicit guidance-embedding value used by their official training recipe. Replace
+   the complete mapping so permissive `**kwargs` forwards do not receive unrelated base keys.
+
+The dataset remains responsible only for strict V2 parsing and CPU media decoding. The adapter
+owns numerical condition/output semantics. The SFT/offline-DPO trainer first calls
+`prepare_condition_state()` once, then calls `encode_output_state()` under `torch.no_grad`; offline
+DPO passes the same prepared object to both preference candidates. Target, chosen, and rejected
+latents are not preprocessing-cache columns. Declared condition and output components are loaded
+through `ModelLoadCoordinator`, never from inside a preparer or codec.
+
+Condition encoding and target encoding should share role-neutral numerical transforms instead of
+duplicating VAE math. Extract helpers for pixel preprocessing, posterior extraction, latent
+normalization, patchification, IDs, and packing, then make the posterior policy an explicit
+argument:
+
+```python
+def encode_vae_image(adapter, pixels, *, sample_mode, generator=None):
+    posterior = adapter.vae.encode(pixels).latent_dist
+    latent = (
+        posterior.sample(generator=generator)
+        if sample_mode == "sample"
+        else posterior.mode()
+    )
+    return normalize_and_pack(adapter, latent)
+```
+
+The helper is role-neutral; the caller is not. Follow the official Diffusers pipeline for each
+role. Condition paths commonly use posterior `argmax`/`mode` for stable conditioning, while
+training targets use posterior `sample` and forward the caller's generator. Never merge the two
+entry points in a way that silently changes this policy. Tests should compare the shared transform
+against the pinned Diffusers helper and assert both sample/argmax behavior and generator routing.
+
+An output codec is not merely an `encode_image()` alias. It may need output-specific geometry,
+multi-component state order, active masks, rate alignment, or forward context that condition
+encoding does not own. If those semantics are not lossless, set a concrete
+`output_state_codec_unavailable_reason` so offline selection fails before downloading weights.
+
+Multi-modal objectives may need a reduction different from trajectory likelihoods. Override the
+protected `_reduce_flow_matching_objective_values()` hook only for that objective. Do not change
+`reduce_latent_values()` merely to implement SFT: online policy gradients, replay log-probability,
+and distillation continue to rely on their established trajectory-wide reduction.
+
+SenseNova is an example of an important boundary: its existing condition schema uses grouped
+`images` with within-type order. Do not advertise heterogeneous ordered references merely because
+several images are accepted. Dataset media and ordered-reference entries use `type` as their sole
+discriminator, including at the adapter preprocessing boundary.
+
 ## Advanced: Custom `preprocess_func`
 
 The default `preprocess_func` calls `encode_prompt`, `encode_image`, `encode_video` and `encode_audio` independently. Override it when your model requires **cross-modal preprocessing** — for example, FLUX.2 uses its text encoder to "upsample" (rewrite) prompts based on input images before encoding ([here](https://github.com/X-GenGroup/Flow-Factory/blob/main/src/flow_factory/models/flux/flux2.py#L371)):
@@ -589,22 +694,30 @@ velocity predictions to `x0`; do not duplicate the sign convention inside a trai
 
 ## Advanced: Pseudo-Pipeline for Non-Diffusers Models
 
-Not all models have a diffusers pipeline. For models like [Bagel](https://github.com/ByteDance-Seed/Bagel) — a unified multimodal foundation model that combines LLM, ViT, and VAE in a single architecture — you can create a **pseudo-pipeline** that mimics the diffusers `Pipeline` interface just enough for `BaseAdapter` to work.
+Not all models have a diffusers pipeline. Unified Transformers models such as
+[Bagel](https://github.com/ByteDance-Seed/Bagel) and
+[SenseNova-U1](https://github.com/OpenSenseNova/SenseNova-U1) can use a
+**pseudo-pipeline** as an explicit component container.
 
-> **Reference implementation**: See [`src/flow_factory/models/bagel/`](../src/flow_factory/models/bagel) (registered as `bagel`) for the complete working example of a non-diffusers pseudo-pipeline adapter.
+> **Reference implementations**:
+> - [`src/flow_factory/models/bagel/`](../src/flow_factory/models/bagel) (`bagel`) exposes the unified Bagel model plus its VAE and tokenizer.
+> - [`src/flow_factory/models/sensenova/`](../src/flow_factory/models/sensenova) (`sensenova`) exposes one `SenseNovaDenoiser` component while NEO-Unify owns tokenization, vision encoding, and pixel-space flow matching.
 
 ### Why a Pseudo-Pipeline?
 
-`BaseAdapter` accesses model components via `getattr(self.pipeline, name)`. It expects a pipeline object with:
+`BaseAdapter` resolves model components through `ComponentRuntime`, not through
+Python attribute probing. A pseudo-pipeline supplies:
 
-1. **Named component attributes** — e.g., `.transformer`, `.vae`, `.scheduler`
+1. **Explicit canonical components** — declared by `PseudoPipelineRuntime`; only components that actually exist are listed
 2. **A `from_pretrained()` class method** — for weight loading
 
-A pseudo-pipeline satisfies these requirements without inheriting from `DiffusionPipeline`. It serves as a **component container** that exposes the right attribute names for `BaseAdapter`'s component management to work.
+A pseudo-pipeline satisfies these requirements without inheriting from
+`DiffusionPipeline`. Do not declare absent components as placeholders: SenseNova,
+for example, has no standalone Flow-Factory VAE or text encoder.
 
 ### Design Pattern
 
-Many non-diffusers models (e.g., Bagel) are a **single composite `nn.Module`** that internally contains sub-modules (LLM, ViT, projectors, etc.). Unlike diffusers pipelines where components are independent top-level objects, these models have a deeply nested structure.
+Many non-diffusers models (e.g., Bagel and SenseNova) are a **single composite `nn.Module`** that internally contains sub-modules (LLM, ViT, projectors, etc.). Unlike diffusers pipelines where components are independent top-level objects, these models have a deeply nested structure.
 
 The key design pattern is to store the **full composite model** on the pipeline while creating **aliases** to its key sub-modules that `BaseAdapter` needs to manage (freeze, LoRA, prepare with accelerator):
 
@@ -741,9 +854,9 @@ For a detailed walkthrough of how `inference()` and `forward()` fit into the six
 >
 > `condition_images` at the method level is **model-dependent** — there is no single canonical batch type:
 > - Single condition image per sample with uniform shape (e.g. Flux1-Kontext): batched `Tensor(B, C, H, W)`. `condition_images[b]` yields `Tensor(C,H,W)`, which `ImageConditionSample.__post_init__` unbinds to `[Tensor(C,H,W)]`.
-> - Multiple condition images per sample, or variable shapes (e.g. Flux2, Qwen-Image-Edit): `List[List[Tensor(C,H,W)]]` of length `B`. `condition_images[b]` yields `List[Tensor(C,H,W)]` directly.
+> - Multiple condition images per sample, or variable shapes (e.g. Flux2, Qwen-Image-Edit, Bagel, SenseNova): `List[List[Tensor(C,H,W)]]` of length `B`. `condition_images[b]` yields `List[Tensor(C,H,W)]` directly.
 >
-> The value stored on `sample.condition_images` after `inference()` is per-sample (no batch dimension); its element type is set by `ImageConditionSample.condition_images_as_pil` — `List[Tensor(C,H,W)]` in `[0,1]` by default, or `List[PIL.Image]` when the adapter persists condition_images via the HF Image feature (declares them in `python_format_columns` and sets `condition_images_as_pil=True` on its sample, e.g. Bagel). `condition_videos` follows the same model-dependent pattern.
+> The value stored on `sample.condition_images` after `inference()` is per-sample (no batch dimension); its element type is set by `ImageConditionSample.condition_images_as_pil` — `List[Tensor(C,H,W)]` in `[0,1]` by default, or `List[PIL.Image]` when the adapter persists condition_images via the HF Image feature (declares them in `python_format_columns` and sets `condition_images_as_pil=True` on its sample, e.g. Bagel and SenseNova). `condition_videos` follows the same model-dependent pattern.
 >
 > Fields stored on `BaseSample` (and subclass) instances are **per-sample** — the batch dimension is stripped. `sample.condition_images` is one sample's images (`List[Tensor(C,H,W)]`, or `List[PIL.Image]` when `condition_images_as_pil=True`), not the full batch. This is enforced at construction time when `inference()` slices `condition_images[b]` for each `b` in `range(batch_size)`.
 
@@ -762,7 +875,7 @@ All encoding methods and `inference()`/`forward()` receive **batched** inputs. H
 | Parameter | Format | Description |
 |---|---|---|
 | `images` | `List[List[Image.Image]]` | **Multi-image batch**: `images[i]` is a list of condition images for sample `i`. Each inner list can have 0, 1, or N images. |
-| `condition_images` | `List[List[Tensor(C,H,W)]]` in `[0,1]` (or `List[List[PIL.Image]]` for `python_format_columns` adapters, e.g. Bagel) | Resized/preprocessed version of above |
+| `condition_images` | `List[List[Tensor(C,H,W)]]` in `[0,1]` (or `List[List[PIL.Image]]` for `python_format_columns` adapters, e.g. Bagel and SenseNova) | Resized/preprocessed version of above |
 | `image_latents` | `List[Tensor(seq,C)]` or `Tensor(B,seq,C)` | VAE-encoded latents. Use `List` for variable-length sequences, `Tensor` when all samples share the same sequence length. |
 
 > The multi-image batch convention (`List[List[...]]`) is critical for models that support varying numbers of condition images per sample. Always normalize your input to this format in `encode_image()`.
@@ -813,9 +926,17 @@ Before submitting a new model adapter, verify:
 - [ ] **`encode_audio()`** — Override only if your model consumes audio; handles `MultiAudioBatch` input format (text/image/video-only models inherit the no-op default)
 - [ ] **`inference()`** — Accepts both raw and pre-encoded inputs; returns `List[Sample]`
 - [ ] **`forward()`** — Single denoising step; ends with `self.scheduler.step()`; returns `SDESchedulerOutput`
+- [ ] **Pipeline I/O contract** — Declares exact input/output media, rate, geometry, and batch semantics before enabling offline training
+- [ ] **Effective checkpoint contract (when needed)** — `_resolve_pipeline_io_contract()` narrows a class-level superset without changing public dataset or algorithm code
+- [ ] **Condition-state preparer (when needed)** — Declaration-only logical component requirements; one input realization reused by every candidate/forward in the batch
+- [ ] **Output-state codec (when supported)** — Declaration-only logical component requirements; on-the-fly detached target encoding; exact geometry validation
+- [ ] **Objective reduction (when specialized)** — Override only the offline flow-matching hook; online trajectory reduction remains unchanged
+- [ ] **Offline forward overrides (when supported)** — Complete immutable adapter mapping; sampling controls never define offline loss semantics; every CFG branch is neutralized or every distilled guidance condition is explicitly pinned
+- [ ] **Role-neutral encoder math** — Condition/output paths reuse transforms but explicitly preserve official posterior `sample` versus `argmax` policy and generator routing
+- [ ] **Explicit offline blocker (when unsupported)** — `output_state_codec_unavailable_reason` names the missing lossless semantic boundary
 - [ ] **Sample dataclass** — All fields without batch dimension; `_shared_fields` correctly set; custom field types are consistent (no `Tensor` vs `List[Tensor]` mixing across samples)
 - [ ] **Registry entry** — Added to `_MODEL_ADAPTER_REGISTRY`
-- [ ] **Tested** — Runs at least one epoch of GRPO training without errors
+- [ ] **Tested** — Runs at least one rollout cycle for online support and one complete dataloader epoch for any declared offline support
 
 ## Component Runtime and Structured Replay
 
@@ -828,6 +949,17 @@ Choose the runtime explicitly in `build_component_runtime()`:
   pipeline.
 
 Component membership uses canonical lookup through declared specs, not `hasattr`.
+When a logical target is a submodule alias of a larger physical root, declare
+`alias_routes` explicitly, for example
+`{"transformer": ("bagel", ("language_model",))}`. The load planner then marks
+the physical root as target-owned; auxiliary lifecycle code can move frozen
+siblings but must leave the prepared target route untouched. `BaseAdapter`
+freezes materialized roots before reopening the logical target.
+
+Adapters should leave `supports_fsdp2_cpu_efficient_loading = False` unless their
+component source can selectively materialize TARGET state without applying the
+rank-zero/meta policy to text encoders, VAEs, or reward models. Modular adapters
+that satisfy this contract may opt in.
 Keep declared specs distinct from materialized modules; use
 `materialize_components(None)` only when the workflow genuinely needs every
 declaration. A prepared/replacement override must be installed through the runtime so

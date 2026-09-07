@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 import torch
 from diffusers.utils.torch_utils import randn_tensor
@@ -21,7 +21,6 @@ from ...samples import (
     ComponentTimes,
     LatentState,
     NoisedState,
-    StackedSampleBatch,
 )
 from ...utils.base import to_broadcast_tensor
 from ...utils.noise_schedule import flow_match_sigma
@@ -32,7 +31,7 @@ def build_training_component_times(
     adapter: Any,
     primary_timesteps: torch.Tensor,
     *,
-    batch: Optional[StackedSampleBatch],
+    batch: Optional[Mapping[str, Any]],
 ) -> ComponentTimes:
     if not isinstance(primary_timesteps, torch.Tensor):
         raise TypeError(
@@ -57,6 +56,32 @@ def build_training_component_times(
         next_timestep={"latent": torch.zeros_like(primary_timesteps)},
         sigma={"latent": sigma},
         next_sigma={"latent": torch.zeros_like(sigma)},
+    )
+
+
+def resolve_replay_projection_times(
+    adapter: Any,
+    times: ComponentTimes,
+    *,
+    batch: Optional[Mapping[str, Any]],
+) -> ComponentTimes:
+    """Prefer authoritative replay sigmas and map only legacy timestep-only data.
+
+    Args:
+        adapter: Adapter that maps a primary scheduler coordinate when needed.
+        times: Coordinates read from one replay transition.
+        batch: Optional stacked batch required by model-specific time mapping.
+
+    Returns:
+        The original stored coordinates when sigmas are present, otherwise mapped
+        coordinates reconstructed from the stored primary timestep.
+    """
+    if times.sigma is not None:
+        return times
+    primary_name = adapter.trajectory_component_order[0]
+    return adapter.build_training_component_times(
+        times.timestep[primary_name],
+        batch=batch,
     )
 
 
@@ -151,6 +176,13 @@ def apply_forward_process_noise(
             f"expected sigma component order {expected_names} for "
             f"apply_forward_process_noise, received {received}"
         )
+    direction = adapter.flow_velocity_direction
+    if direction not in ("noise", "data"):
+        raise ValueError(
+            "expected flow_velocity_direction to be 'noise' or 'data' for "
+            f"apply_forward_process_noise, received {direction!r}"
+        )
+    velocity_sign = 1.0 if direction == "noise" else -1.0
     primary_name = expected_names[0]
     primary_clean = clean_state.components[primary_name]
     if primary_clean.ndim < 2:
@@ -192,7 +224,7 @@ def apply_forward_process_noise(
             )
         sigma = to_broadcast_tensor(sigma, clean_latents)
         component_noised = (1 - sigma) * clean_latents + sigma * component_noise
-        component_target = component_noise - clean_latents
+        component_target = velocity_sign * (component_noise - clean_latents)
         if clean_state.active_masks is not None:
             # The draw above already consumed the full-shape RNG stream; masking only
             # decides which elements move, so inactive conditioning stays clean and

@@ -17,9 +17,13 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, ClassVar, Mapping, Optional, Tuple, cast
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Tuple, cast
 
+from ...contracts.execution import (
+    ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT,
+    ExecutionContract,
+)
 from ..optimizer_args import AdamWOptimizerArguments
 from ._base import TrainingArguments
 
@@ -48,6 +52,8 @@ def _finite_float(value: object, field_name: str, *, allow_zero: bool) -> float:
 @dataclass
 class DMD2TrainingArguments(TrainingArguments):
     """Configure data-free DMD2 distribution matching."""
+
+    execution_contract: ClassVar[ExecutionContract] = ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT
 
     gradient_step_per_epoch: int = field(
         default=1,
@@ -143,47 +149,6 @@ class DMD2TrainingArguments(TrainingArguments):
                 f"0 <= lower < upper <= 1, received {(lower, upper)!r}"
             )
         self.perturbation_timestep_range = (lower, upper)
-
-    @classmethod
-    def from_dict(cls, values: Mapping[str, Any]) -> DMD2TrainingArguments:
-        """Build strict algorithm arguments from a mapping.
-
-        Args:
-            values: User-provided training field mapping.
-
-        Returns:
-            Parsed DMD2 training arguments.
-        """
-        if not isinstance(values, Mapping):
-            raise TypeError(
-                "expected training arguments as a mapping, "
-                f"received {type(values).__name__}: {values!r}"
-            )
-        expected_fields = {config_field.name for config_field in fields(cls) if config_field.init}
-        unknown_fields = set(values) - expected_fields
-        retired_fields = unknown_fields & {
-            "dfake_gen_update_ratio",
-            "fake_updates_per_generator",
-            "dm_loss_type",
-            "dm_step_scale",
-            "pseudo_huber_c_scale",
-        }
-        if retired_fields:
-            raise ValueError(
-                f"{cls.__name__} retired field(s) {tuple(sorted(retired_fields))!r}; "
-                "use train.ttur_fake_updates for the fake-first TTUR count"
-            )
-        if unknown_fields:
-            raise ValueError(
-                f"unknown {cls.__name__} field(s) {tuple(sorted(unknown_fields))!r}; "
-                f"expected {tuple(sorted(expected_fields))!r}"
-            )
-        explicit_extras = values.get("extra_kwargs")
-        if explicit_extras:
-            raise ValueError(
-                f"{cls.__name__} does not accept extra_kwargs; received {explicit_extras!r}"
-            )
-        return cls(**dict(values))
 
     def role_update_plan(self) -> "RoleUpdatePlan":
         """Return fake TTUR phases followed by one generator phase."""

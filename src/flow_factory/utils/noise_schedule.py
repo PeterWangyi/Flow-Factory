@@ -42,11 +42,43 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from .precision import within_one_native_ulp
+
 TIMESTEP_MAX = 1000.0
 
 
 def flow_match_sigma(t_scheduler: torch.Tensor) -> torch.Tensor:
-    """Map scheduler timestep in [0, TIMESTEP_MAX] to σ in [0, 1] for x_t = (1-σ)x0 + σ ε."""
+    """Map a valid scheduler timestep to flow-matching sigma.
+
+    Args:
+        t_scheduler: Scheduler-scale tensor in ``[0, TIMESTEP_MAX]``.
+
+    Returns:
+        Sigma in ``[0, 1]`` with the caller's floating dtype, or the default
+        floating dtype for integer inputs.
+
+    Raises:
+        TypeError: If ``t_scheduler`` is not a tensor.
+        ValueError: If any timestep is non-finite or outside the public range.
+    """
+    if not isinstance(t_scheduler, torch.Tensor):
+        raise TypeError(
+            "expected torch.Tensor t_scheduler, received "
+            f"{type(t_scheduler).__name__}: {t_scheduler!r}"
+        )
+    if (
+        not bool(torch.isfinite(t_scheduler).all())
+        or bool((t_scheduler < 0).any())
+        or bool((t_scheduler > TIMESTEP_MAX).any())
+    ):
+        raise ValueError(
+            f"expected t_scheduler in [0, {TIMESTEP_MAX:g}], received " f"{t_scheduler.tolist()}"
+        )
+    return _flow_match_sigma_unchecked(t_scheduler)
+
+
+def _flow_match_sigma_unchecked(t_scheduler: torch.Tensor) -> torch.Tensor:
+    """Convert an already-validated scheduler tensor without host synchronization."""
     output_dtype = (
         t_scheduler.dtype if t_scheduler.is_floating_point() else torch.get_default_dtype()
     )
@@ -55,6 +87,74 @@ def flow_match_sigma(t_scheduler: torch.Tensor) -> torch.Tensor:
     # float64, then restore the caller's dtype so strict open intervals remain
     # strict and CPU/GPU produce the same result.
     return (t_scheduler.to(torch.float64) / TIMESTEP_MAX).clamp(0.0, 1.0).to(output_dtype)
+
+
+def validate_flow_match_coordinates(
+    t_scheduler: torch.Tensor,
+    sigma: torch.Tensor,
+    *,
+    identifier: str = "flow-matching coordinates",
+) -> None:
+    """Validate redundant flow-matching coordinates within one native ULP.
+
+    ``t_scheduler`` and ``sigma`` may be rounded independently when one is
+    materialized as ``sigma * TIMESTEP_MAX``. Comparing in sigma space with the
+    larger native unit in the last place (ULP) accepts that representation noise
+    without hiding a semantic schedule mismatch.
+
+    Args:
+        t_scheduler: Scheduler-scale timesteps in ``[0, TIMESTEP_MAX]``.
+        sigma: Flow-matching sigma coordinates in ``[0, 1]``.
+
+    Raises:
+        TypeError: If timestep is not a real numeric tensor or sigma is not floating.
+        ValueError: If shape, device, domain, or coordinate relation is invalid.
+    """
+    if (
+        not isinstance(t_scheduler, torch.Tensor)
+        or t_scheduler.dtype == torch.bool
+        or t_scheduler.is_complex()
+    ):
+        raise TypeError(
+            f"expected {identifier} t_scheduler as real numeric torch.Tensor, received "
+            f"{type(t_scheduler).__name__}/{getattr(t_scheduler, 'dtype', None)}"
+        )
+    if not isinstance(sigma, torch.Tensor) or not sigma.is_floating_point():
+        raise TypeError(
+            f"expected {identifier} sigma as floating torch.Tensor, received "
+            f"{type(sigma).__name__}/{getattr(sigma, 'dtype', None)}"
+        )
+    if t_scheduler.shape != sigma.shape:
+        raise ValueError(
+            f"expected {identifier} shapes to match, received "
+            f"t_scheduler={tuple(t_scheduler.shape)} and sigma={tuple(sigma.shape)}"
+        )
+    if t_scheduler.device != sigma.device:
+        raise ValueError(
+            f"expected {identifier} devices to match, received "
+            f"t_scheduler={t_scheduler.device} and sigma={sigma.device}"
+        )
+    valid = (
+        torch.isfinite(t_scheduler)
+        & torch.isfinite(sigma)
+        & (t_scheduler >= 0)
+        & (t_scheduler <= TIMESTEP_MAX)
+        & (sigma >= 0)
+        & (sigma <= 1)
+    )
+    if not bool(valid.all()):
+        raise ValueError(
+            f"expected {identifier} timestep and sigma finite with timestep in "
+            f"[0, {TIMESTEP_MAX:g}] and sigma in [0, 1], received "
+            f"timestep={t_scheduler.tolist()} and sigma={sigma.tolist()}"
+        )
+
+    expected_sigma = _flow_match_sigma_unchecked(t_scheduler)
+    if not within_one_native_ulp(expected_sigma, sigma):
+        raise ValueError(
+            f"expected {identifier} timestep == sigma * {TIMESTEP_MAX:g} within one native "
+            f"ULP, received timestep={t_scheduler.tolist()} and sigma={sigma.tolist()}"
+        )
 
 
 def fraction_range_to_t_bounds(frac_lo: float, frac_hi: float) -> Tuple[float, float]:
@@ -163,6 +263,40 @@ class TimeSampler:
         return t.unsqueeze(1).expand(num_timesteps, batch_size)
 
     @staticmethod
+    def independent_logit_normal_shifted(
+        batch_size: int,
+        num_timesteps: int,
+        timestep_range: Union[float, Tuple[float, float]],
+        logit_mean: float = 0.0,
+        logit_std: float = 1.0,
+        time_shift: float = 1.0,
+        device: torch.device = torch.device("cpu"),
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        """Draw an independent logit-normal coordinate per term and sample.
+
+        Unlike :meth:`logit_normal_shifted`, this offline-oriented method
+        materializes ``(num_timesteps, batch_size)`` rather than expanding one
+        coordinate across each batch row. The legacy online RNG path remains
+        unchanged.
+        """
+        _require_positive_int(batch_size, "batch_size")
+        _require_positive_int(num_timesteps, "num_timesteps")
+        output_device = torch.device(device)
+        rng_device = _rng_device(generator, output_device)
+        u_standard = torch.randn(
+            (num_timesteps, batch_size),
+            generator=generator,
+            device=rng_device,
+        )
+        raw = torch.sigmoid(u_standard * logit_std + logit_mean)
+        raw = time_shift * raw / (1 + (time_shift - 1) * raw)
+        raw = torch.clamp(raw, min=0.01, max=1.0 - 1e-6)
+        frac_lo, frac_hi = _normalize_timestep_range(timestep_range)
+        frac = frac_lo + raw * (frac_hi - frac_lo)
+        return (TIMESTEP_MAX * (1.0 - frac)).to(output_device)
+
+    @staticmethod
     def uniform(
         batch_size: int,
         num_timesteps: int,
@@ -189,6 +323,31 @@ class TimeSampler:
             f = time_shift * f / (1 + (time_shift - 1) * f)
         t = TIMESTEP_MAX * (1.0 - f)
         return t.to(device).unsqueeze(1).expand(-1, batch_size)
+
+    @staticmethod
+    def independent_uniform(
+        batch_size: int,
+        num_timesteps: int,
+        timestep_range: Union[float, Tuple[float, float]],
+        time_shift: float = 1.0,
+        device: torch.device = torch.device("cpu"),
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        """Draw an independent uniform coordinate per term and sample."""
+        _require_positive_int(batch_size, "batch_size")
+        _require_positive_int(num_timesteps, "num_timesteps")
+        output_device = torch.device(device)
+        rng_device = _rng_device(generator, output_device)
+        frac_lo, frac_hi = _normalize_timestep_range(timestep_range)
+        fraction = torch.rand(
+            (num_timesteps, batch_size),
+            generator=generator,
+            device=rng_device,
+        )
+        fraction = frac_lo + fraction * (frac_hi - frac_lo)
+        if abs(time_shift - 1.0) > 1e-6:
+            fraction = time_shift * fraction / (1 + (time_shift - 1) * fraction)
+        return (TIMESTEP_MAX * (1.0 - fraction)).to(output_device)
 
     @staticmethod
     def discrete(
@@ -266,3 +425,13 @@ class TimeSampler:
         lower, upper = boundaries[:-1].long(), boundaries[1:].long()
         rand_u = torch.rand(num_samples, generator=generator, device=rng_device).to(device)
         return lower + (rand_u * (upper - lower)).long()
+
+
+def _require_positive_int(value: object, field_name: str) -> None:
+    """Require a positive exact integer for materialized sampler shapes."""
+    if type(value) is not int:
+        raise TypeError(
+            f"expected {field_name} to be int, received {type(value).__name__}: {value!r}"
+        )
+    if value < 1:
+        raise ValueError(f"expected {field_name} >= 1, received {value}")

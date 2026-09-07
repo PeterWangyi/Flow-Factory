@@ -11,12 +11,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
 import pytest
 import torch
+from PIL import Image
 
+from flow_factory.data_utils.offline_condition_cache import build_offline_condition_cache
+from flow_factory.data_utils.schema import normalize_v2_record
 from flow_factory.models.minimax_h3.adapters import (
     MiniMaxH3FL2VAAdapter,
     MiniMaxH3Ref2VAAdapter,
@@ -63,6 +67,20 @@ def _adapter(adapter_class: type, transformer: Any = None) -> Any:
                 "num_frames": 5,
             },
         ),
+        (
+            MiniMaxH3FL2VAAdapter,
+            {
+                "images": [["ending"]],
+                "image_slots": [["last_frame"]],
+            },
+            {
+                "prompt": "describe",
+                "last_image": "ending",
+                "height": 64,
+                "width": 96,
+                "num_frames": 5,
+            },
+        ),
     ],
 )
 def test_preprocess_uses_exact_workflow_inputs_and_b1(
@@ -87,14 +105,79 @@ def test_preprocess_uses_exact_workflow_inputs_and_b1(
         adapter.preprocess_func(prompt=["one", "two"], height=64, width=96, num_frames=5)
 
 
+def test_v2_last_only_condition_reaches_h3_preprocess_through_arrow(tmp_path, monkeypatch) -> None:
+    """The complete public-schema/cache path preserves a sparse last-frame binding."""
+    ending_path = tmp_path / "ending.png"
+    Image.new("RGB", (16, 16), color=(12, 34, 56)).save(ending_path)
+    record = normalize_v2_record(
+        {
+            "schema_version": 2,
+            "input": {
+                "prompt": "Reveal what led to this ending.",
+                "media": [
+                    {
+                        "type": "image",
+                        "path": ending_path.name,
+                        "slot": "last_frame",
+                    }
+                ],
+            },
+            "supervision": {
+                "type": "demonstration",
+                "target": {
+                    "media": [
+                        {"type": "video", "path": "target.mp4", "fps": 24.0},
+                        {
+                            "type": "audio",
+                            "path": "target.wav",
+                            "sample_rate": 32000,
+                        },
+                    ]
+                },
+            },
+            "metadata": {},
+        },
+        dataset_dir=tmp_path,
+    )
+    calls: List[Any] = []
+    monkeypatch.setattr(
+        "flow_factory.models.minimax_h3.workflow.encode_h3_workflow_inputs",
+        lambda pipeline, values, workflow: calls.append((workflow, values))
+        or {"prompt_embeds": torch.zeros(1, 2, 4)},
+    )
+    adapter = _adapter(MiniMaxH3FL2VAAdapter)
+
+    cache = build_offline_condition_cache(
+        [record],
+        source_name="h3-last-only",
+        dataset_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
+        preprocess_func=adapter.preprocess_func,
+        preprocess_kwargs={
+            "height": 64,
+            "width": 96,
+            "num_frames": 124,
+        },
+        pipeline_io_contract=adapter.pipeline_io_contract,
+        preprocessing_batch_size=1,
+    )
+
+    assert len(cache) == 1
+    assert len(calls) == 1
+    workflow, values = calls[0]
+    assert workflow == "fl2va"
+    assert "image" not in values
+    assert isinstance(values["last_image"], Image.Image)
+    assert values["last_image"].size == (16, 16)
+
+
 def test_preprocess_adds_outer_batch_to_arrow_cache_fields(monkeypatch) -> None:
     monkeypatch.setattr(
         "flow_factory.models.minimax_h3.workflow.encode_h3_workflow_inputs",
         lambda *args, **kwargs: {
             "prompt_embeds": torch.zeros(1, 2, 4),
-            "text_token_tags": torch.tensor([1, 1]),
+            "token_tags": torch.tensor([1, 1]),
             "height": 64,
-            "keyframe_anchors": (),
         },
     )
     adapter = _adapter(MiniMaxH3T2VAAdapter)
@@ -107,17 +190,18 @@ def test_preprocess_adds_outer_batch_to_arrow_cache_fields(monkeypatch) -> None:
     )
 
     assert result["prompt_embeds"].shape == (1, 2, 4)
-    assert len(result["text_token_tags"]) == 1
-    torch.testing.assert_close(result["text_token_tags"][0], torch.tensor([1, 1]))
+    assert len(result["token_tags"]) == 1
+    torch.testing.assert_close(result["token_tags"][0], torch.tensor([1, 1]))
     assert result["height"] == [64]
-    assert result["keyframe_anchors"] == [[]]
 
 
 def test_ref_preprocess_builds_ordered_pinned_objects_without_returning_them(monkeypatch) -> None:
     constructed: List[Any] = []
 
-    def reference_type(kind: str):
-        return lambda **kwargs: constructed.append((kind, kwargs)) or SimpleNamespace(kind=kind)
+    def reference_type(media_type: str):
+        return lambda **kwargs: constructed.append((media_type, kwargs)) or SimpleNamespace(
+            media_type=media_type
+        )
 
     monkeypatch.setattr(
         "flow_factory.models.minimax_h3.workflow.require_minimax_h3_support",
@@ -136,16 +220,16 @@ def test_ref_preprocess_builds_ordered_pinned_objects_without_returning_them(mon
     )
     adapter = _adapter(MiniMaxH3Ref2VAAdapter)
     references = [
-        {"kind": "image", "path": "i.png", "media": "image"},
+        {"type": "image", "path": "i.png", "media": "image"},
         {
-            "kind": "video",
+            "type": "video",
             "path": "v.mp4",
             "frames": "frames",
             "fps": 24.0,
             "audio": torch.zeros(2, 8),
             "sample_rate": 32000,
         },
-        {"kind": "audio", "path": "a.wav", "media": torch.ones(1, 8), "sample_rate": 16000},
+        {"type": "audio", "path": "a.wav", "media": torch.ones(1, 8), "sample_rate": 16000},
     ]
 
     result = adapter.preprocess_func(
@@ -157,10 +241,14 @@ def test_ref_preprocess_builds_ordered_pinned_objects_without_returning_them(mon
         num_frames=5,
     )
 
-    assert [kind for kind, _ in constructed] == ["image", "video", "audio"]
+    assert [media_type for media_type, _ in constructed] == ["image", "video", "audio"]
     assert constructed[1][1]["frames"] == "frames"
     assert "video" not in constructed[1][1]
-    assert [ref.kind for ref in encoded_inputs["references"]] == ["image", "video", "audio"]
+    assert [ref.media_type for ref in encoded_inputs["references"]] == [
+        "image",
+        "video",
+        "audio",
+    ]
     assert result["reference_manifest"] == ["manifest"]
     assert "references" not in result
     assert all(not isinstance(value, SimpleNamespace) for value in result.values())
@@ -204,6 +292,7 @@ def test_training_times_map_primary_video_coordinate_to_audio_shift(
 
 def test_inference_collects_structured_target_only_trajectory(monkeypatch) -> None:
     calls: List[Any] = []
+    cache_events: List[Any] = []
     prepared_values: List[Dict[str, Any]] = []
     prefixes = {
         "video": torch.ones(1, 1, 96),
@@ -231,6 +320,7 @@ def test_inference_collects_structured_target_only_trajectory(monkeypatch) -> No
     )
 
     def forward(*args, **kwargs):
+        cache_events.append(("step", len(calls)))
         calls.append((args[1], kwargs))
         value = float(len(calls))
         return SimpleNamespace(
@@ -252,7 +342,26 @@ def test_inference_collects_structured_target_only_trajectory(monkeypatch) -> No
         lambda *args, **kwargs: (torch.zeros(1, 2, 3, 4, 4), torch.zeros(1, 2, 16), 32000),
         raising=False,
     )
-    adapter = _adapter(MiniMaxH3T2VAAdapter, transformer=torch.nn.Linear(1, 1))
+
+    class CacheAwareTransformer(torch.nn.Module):
+        is_cache_enabled = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+        def _reset_stateful_cache(self) -> None:
+            cache_events.append(("reset", len(calls)))
+
+        @contextmanager
+        def cache_context(self, name: str):
+            cache_events.append(("enter", name, len(calls)))
+            try:
+                yield
+            finally:
+                cache_events.append(("exit", name, len(calls)))
+
+    adapter = _adapter(MiniMaxH3T2VAAdapter, transformer=CacheAwareTransformer())
     adapter_forward = adapter.forward
     adapter_forward_calls: List[Dict[str, Any]] = []
     adapter_decode = adapter.decode_latents
@@ -338,6 +447,76 @@ def test_inference_collects_structured_target_only_trajectory(monkeypatch) -> No
     assert final_only.trajectory is not None
     assert final_only.trajectory.log_probs is None
     assert final_only.trajectory.log_prob_index_map is None
+    assert [event for event in cache_events if event[0] == "reset"] == [
+        ("reset", 0),
+        ("reset", 2),
+    ]
+    assert [event for event in cache_events if event[0] == "step"] == [
+        ("step", 0),
+        ("step", 1),
+        ("step", 2),
+        ("step", 3),
+    ]
+    assert [event[1] for event in cache_events if event[0] == "enter"] == ["minimax_h3_t2va"] * 4
+
+
+def test_ref_forward_cache_context_owns_inner_while_forward_uses_prepared_route(
+    monkeypatch,
+) -> None:
+    from flow_factory.models.model_bundle import RoutedComponentProxy
+
+    events: List[Any] = []
+
+    class CacheAwareInner(torch.nn.Module):
+        is_cache_enabled = True
+
+        @contextmanager
+        def cache_context(self, name: str):
+            events.append(("enter", name))
+            try:
+                yield
+            finally:
+                events.append(("exit", name))
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            events.append(("inner",))
+            return value
+
+    inner = CacheAwareInner()
+
+    class PreparedBundle(torch.nn.Module):
+        def forward(self, name: str, *args: Any, **kwargs: Any) -> Any:
+            events.append(("bundle", name))
+            return inner(*args, **kwargs)
+
+    proxy = RoutedComponentProxy(
+        PreparedBundle(),
+        "transformer_ref",
+        inner,
+    )
+
+    def forward(transformer, state, *args, **kwargs):
+        transformer(torch.ones(1))
+        return state
+
+    monkeypatch.setattr("flow_factory.models.minimax_h3.workflow.forward_h3_state", forward)
+    adapter = _adapter(MiniMaxH3Ref2VAAdapter, transformer=proxy)
+
+    adapter.forward(
+        state=_state(),
+        times=_times(),
+        condition_prefixes={},
+        prompt_embeds=torch.zeros(1, 2, 4),
+        layout={},
+        return_fields=("velocity",),
+    )
+
+    assert events == [
+        ("enter", "minimax_h3_ref2va"),
+        ("bundle", "transformer_ref"),
+        ("inner",),
+        ("exit", "minimax_h3_ref2va"),
+    ]
 
 
 def test_forward_state_uses_prepared_component_and_forward_parity(monkeypatch) -> None:

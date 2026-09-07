@@ -16,14 +16,15 @@ import glob
 import hashlib
 import json
 import logging
-import shutil
 
 # src/flow_factory/models/abc.py
 import os
 import re
+import shutil
 from abc import ABC, abstractmethod
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, fields
+from types import MappingProxyType
 from typing import (
     Any,
     ClassVar,
@@ -70,8 +71,10 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from PIL import Image
 from safetensors.torch import load_file, save_file
 
+from ..contracts import PipelineIOContract
 from ..ema import EMAModuleWrapper
 from ..hparams import *
+from ..hparams.gradient_checkpointing import GradientCheckpointingSpec
 from ..samples import (
     BaseSample,
     ComponentTimes,
@@ -101,8 +104,35 @@ from ..utils.image import MultiImageBatch
 from ..utils.logger_utils import setup_logger
 from ..utils.video import MultiVideoBatch
 from . import trajectory_bridge as bridge
+from .checkpointing import (
+    CheckpointUnit,
+    discover_gradient_checkpointing_units,
+    select_gradient_checkpointing_units,
+    selective_gradient_checkpointing_function,
+)
+from .condition_state import (
+    ConditionStatePreparer,
+    PreparedConditionState,
+    validate_condition_preparer_required_components,
+)
 from .latent_geometry import LatentAxes, infer_latent_axes
 from .model_bundle import RoutedComponentProxy
+from .output_state import (
+    DecodedMediaBatch,
+    EncodedOutputState,
+    OutputStateCodec,
+    validate_codec_required_components,
+    validate_encoded_output_state,
+    validate_output_candidate_batch,
+)
+from .precision import (
+    build_component_load_dtype_kwargs,
+    cast_module_role_dtypes,
+    component_dtype_mapping,
+    parameter_dtype_inventory,
+    resolve_component_dtype,
+    validate_dtype_policy_selectors,
+)
 from .runtime import ClassicPipelineRuntime, ComponentRuntime
 from .variants import DEFAULT_BASE_VARIANT, ComponentVariantRegistry, ComponentVariantSpec
 
@@ -169,6 +199,7 @@ class BaseAdapter(ABC):
     """
 
     _DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+    component_load_dtype_defaults: ClassVar[Any] = None
 
     lora_keys: List[str] = [
         "lora_A",
@@ -199,13 +230,38 @@ class BaseAdapter(ABC):
     python_format_columns: ClassVar[frozenset[str]] = frozenset()
 
     # Opt in only when every transformer forward branch runs inside a diffusers
-    # ``cache_context``. The rollout cache accelerator rejects the default.
+    # ``cache_context`` while caching is enabled. The rollout cache accelerator
+    # rejects the default. ``None`` preserves the existing all-policy behavior for
+    # cache-ready adapters; models with narrower upstream support declare the exact
+    # user-facing policy ids they accept.
     supports_diffusers_cache: ClassVar[bool] = False
+    supported_diffusers_cache_policies: ClassVar[Optional[frozenset[str]]] = None
+    supports_fsdp2_cpu_efficient_loading: ClassVar[bool] = False
+    # Opt in only when FSDP2 communication overlap exceeds the model's activation headroom.
+    fsdp2_use_default_stream_unshard: ClassVar[bool] = False
+    fsdp2_additional_wrap_module_names: ClassVar[Tuple[str, ...]] = ()
+    # The adapter may place one checkpoint inside each FSDP-wrapped block forward.
+    fsdp2_use_in_forward_activation_checkpointing: ClassVar[bool] = False
+    # Opt in when backward all-gather overlap exceeds the model's peak headroom.
+    fsdp2_disable_backward_prefetch: ClassVar[bool] = False
     supports_ordered_references: ClassVar[bool] = False
     preprocess_cache_fields: ClassVar[frozenset[str]] = frozenset()
     preprocess_cache_version: ClassVar[str] = ""
     trajectory_component_order: ClassVar[Tuple[str, ...]] = ("latent",)
+    pipeline_io_contract: ClassVar[Optional[PipelineIOContract]] = None
+    # A non-empty explanation means that this adapter is intentionally online-only
+    # for now. Offline trainer loading surfaces it before model weights are loaded,
+    # while online algorithms may continue to construct and use the adapter.
+    output_state_codec_unavailable_reason: ClassVar[Optional[str]] = None
     flow_velocity_direction: ClassVar[Literal["noise", "data"]] = "noise"
+    # Model conditioning for finite-data velocity matching. These arguments are
+    # deliberately independent of sampling configuration and take precedence over
+    # both training arguments and dataset conditions. Conventional CFG adapters
+    # inherit the neutral scale; adapters with learned guidance embeddings or
+    # additional CFG branches replace the complete immutable mapping.
+    offline_training_forward_overrides: ClassVar[Mapping[str, Any]] = MappingProxyType(
+        {"guidance_scale": 1.0}
+    )
 
     # Resolution-invariant latent axis roles for the model-agnostic latent state
     # API (see `latent_geometry.py`). ``None`` means "infer from latent ndim" via
@@ -227,8 +283,12 @@ class BaseAdapter(ABC):
     # name. Overriding one would silently bypass that contract, so subclasses are
     # rejected at class creation instead of at training time.
     _BOUNDARY_OWNING_METHODS: ClassVar[Tuple[str, ...]] = (
+        "prepare_condition_state",
+        "encode_output_state",
+        "decode_output_state",
         "forward_state",
         "reduce_component_latent_values",
+        "reduce_flow_matching_objective_values",
         "reduce_latent_values",
     )
 
@@ -236,11 +296,21 @@ class BaseAdapter(ABC):
         super().__init_subclass__(**kwargs)
         for name in BaseAdapter._BOUNDARY_OWNING_METHODS:
             if name in cls.__dict__:
+                if name == "encode_output_state":
+                    override_hint = (
+                        "Provide build_output_state_codec() and "
+                        "_validate_encoded_output_geometry() instead."
+                    )
+                elif name == "prepare_condition_state":
+                    override_hint = "Provide build_condition_state_preparer() instead."
+                elif name == "decode_output_state":
+                    override_hint = "Override the protected hook _decode_output_state instead."
+                else:
+                    override_hint = f"Override the protected hook _{name} instead."
                 raise TypeError(
                     f"adapter {cls.__name__} must not override BaseAdapter.{name}: it owns a "
                     f"shared contract that an override would bypass ({name} validates its "
-                    f"arguments and its result on behalf of every caller). Override the "
-                    f"protected hook _{name} instead."
+                    f"arguments and its result on behalf of every caller). {override_hint}"
                 )
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
@@ -252,6 +322,12 @@ class BaseAdapter(ABC):
         self.eval_args = config.eval_args
         self._mode: str = "train"  # ['train', 'eval', 'rollout']
         self._named_parameters: Dict[str, NamedParametersInfo] = {}
+        self._component_load_dtype_manifest = self.component_load_dtype_defaults
+        self._component_load_dtype_overrides = getattr(
+            self.model_args,
+            "component_load_dtypes",
+            None,
+        )
 
         # Build the component runtime while preserving the public pipeline alias.
         self.component_runtime = self.build_component_runtime()
@@ -273,11 +349,38 @@ class BaseAdapter(ABC):
                 "expected SchedulerGroup.primary to be the canonical pipeline scheduler, "
                 f"received primary component {self.scheduler_group.primary_name!r}"
             )
+        self._effective_pipeline_io_contract = self._resolve_pipeline_io_contract()
+        if self._effective_pipeline_io_contract is not None and not isinstance(
+            self._effective_pipeline_io_contract,
+            PipelineIOContract,
+        ):
+            raise TypeError(
+                f"adapter {type(self).__name__} expected _resolve_pipeline_io_contract() "
+                "to return PipelineIOContract or None, received "
+                f"{type(self._effective_pipeline_io_contract).__name__}: "
+                f"{self._effective_pipeline_io_contract!r}"
+            )
 
         # Compatibility alias: the runtime override mapping is the sole authoritative cache.
         self._components: Dict[str, torch.nn.Module] = cast(
             Dict[str, torch.nn.Module], self.component_runtime.override_components
         )
+        self.model_args.target_components = self.component_runtime.resolve_component_names(
+            self.model_args.target_components
+        )
+
+        # Build per-request input-condition realization after the component runtime
+        # exists, but before any codec may consume its declaration. Like the output
+        # codec, the preparer declares lifecycle metadata only.
+        self._condition_state_preparer = self._build_condition_state_preparer_declaration()
+        self._condition_state_encoding_modules = self._validate_condition_state_preparer_lifecycle()
+
+        # Build target-media encoding only after load-dtype policy, component runtime,
+        # scheduler group, and target-name canonicalization are established. The codec
+        # declaration is immutable lifecycle metadata; it must not materialize, load,
+        # move, or mutate component dtypes.
+        self._output_state_codec = self._build_output_state_codec_declaration()
+        self._output_state_encoding_modules = self._validate_output_state_codec_lifecycle()
 
         # Cache target module mapping
         self.target_module_map = self._init_target_module_map()
@@ -316,7 +419,12 @@ class BaseAdapter(ABC):
         # It is intentionally NOT set here.
 
         # Enable gradient checkpointing if needed
-        if self.training_args.enable_gradient_checkpointing:
+        checkpointing_enabled = getattr(
+            self.training_args,
+            "gradient_checkpointing_enabled",
+            bool(getattr(self.training_args, "enable_gradient_checkpointing", False)),
+        )
+        if checkpointing_enabled:
             self.enable_gradient_checkpointing()
 
     # ================================== Post Init =================================
@@ -384,6 +492,426 @@ class BaseAdapter(ABC):
             return state
         return LatentState(components, active_masks=state.active_masks)
 
+    # =========================== Condition-State Preparation =======================
+    @property
+    def effective_pipeline_io_contract(self) -> Optional[PipelineIOContract]:
+        """Return the checkpoint-realized pipeline input/output contract."""
+        return getattr(
+            self,
+            "_effective_pipeline_io_contract",
+            type(self).pipeline_io_contract,
+        )
+
+    def _resolve_pipeline_io_contract(self) -> Optional[PipelineIOContract]:
+        """Resolve checkpoint-specific capabilities from the class declaration.
+
+        Most adapters use one immutable class-level contract. An adapter wrapping
+        checkpoint variants with narrower input semantics may override this hook
+        and return a validated specialization after its pipeline config is known.
+
+        Returns:
+            Effective contract for this adapter instance, or ``None``.
+        """
+        return type(self).pipeline_io_contract
+
+    def _build_condition_state_preparer_declaration(
+        self,
+    ) -> Optional[ConditionStatePreparer]:
+        """Build preparer metadata without changing component runtime state."""
+        materialized_before = tuple(self.component_runtime.materialized_component_names)
+        overrides_before = tuple(self.component_runtime.override_components)
+        preparer = self.build_condition_state_preparer()
+        materialized_after = tuple(self.component_runtime.materialized_component_names)
+        overrides_after = tuple(self.component_runtime.override_components)
+        if materialized_after != materialized_before or overrides_after != overrides_before:
+            raise RuntimeError(
+                f"adapter {type(self).__name__}.build_condition_state_preparer() must be "
+                "declaration-only and cannot materialize or replace components: "
+                f"materialized_before={materialized_before}, "
+                f"materialized_after={materialized_after}, "
+                f"overrides_before={overrides_before}, overrides_after={overrides_after}"
+            )
+        return preparer
+
+    @property
+    def condition_state_preparer(self) -> Optional[ConditionStatePreparer]:
+        """Return the immutable preparer selected during adapter construction."""
+        return getattr(self, "_condition_state_preparer", None)
+
+    @property
+    def condition_state_encoding_modules(self) -> Tuple[str, ...]:
+        """Return validated component names required for condition realization."""
+        return self._condition_state_encoding_modules
+
+    def build_condition_state_preparer(self) -> Optional[ConditionStatePreparer]:
+        """Build the adapter-owned runtime condition preparer, if required.
+
+        The default identity path needs no declaration. A model whose input
+        condition depends on runtime geometry, stochastic augmentation, or an
+        on-device encoder returns a declaration-only preparer here.
+
+        Returns:
+            Adapter-owned preparer, or ``None`` for identity preparation.
+        """
+        return None
+
+    def _validate_condition_state_preparer_lifecycle(self) -> Tuple[str, ...]:
+        """Validate condition-preparer lifecycle metadata."""
+        preparer = self.condition_state_preparer
+        if preparer is None:
+            return ()
+        return validate_condition_preparer_required_components(
+            preparer,
+            tuple(self.component_runtime.declared_component_names),
+        )
+
+    def prepare_condition_state(
+        self,
+        condition: Mapping[str, Any],
+        generator: Optional[torch.Generator] = None,
+    ) -> PreparedConditionState:
+        """Realize one input-owned condition state for a request or batch.
+
+        Args:
+            condition: Cached input-only model condition.
+            generator: Optional generator for adapter-owned stochastic realization.
+
+        Returns:
+            Validated prepared condition reused by every candidate and forward
+            derived from this request.
+        """
+        if not isinstance(condition, Mapping):
+            raise TypeError(
+                "expected condition-state input to be Mapping[str, Any], "
+                f"received {type(condition).__name__}: {condition!r}"
+            )
+        if generator is not None and not isinstance(generator, torch.Generator):
+            raise TypeError(
+                "expected condition-state generator to be torch.Generator or None, "
+                f"received {type(generator).__name__}: {generator!r}"
+            )
+        preparer = self.condition_state_preparer
+        if preparer is None:
+            return PreparedConditionState.identity(condition)
+        with torch.no_grad():
+            prepared = preparer.prepare_condition_state(condition, generator)
+        if not isinstance(prepared, PreparedConditionState):
+            raise TypeError(
+                "condition-state preparer must return PreparedConditionState, "
+                f"received {type(prepared).__name__}"
+            )
+        return prepared
+
+    # ============================ Output-State Encoding ============================
+    def _build_output_state_codec_declaration(self) -> Optional[OutputStateCodec]:
+        """Build codec metadata without changing component materialization or overrides."""
+        materialized_before = tuple(self.component_runtime.materialized_component_names)
+        overrides_before = tuple(self.component_runtime.override_components)
+        codec = self.build_output_state_codec()
+        materialized_after = tuple(self.component_runtime.materialized_component_names)
+        overrides_after = tuple(self.component_runtime.override_components)
+        if materialized_after != materialized_before or overrides_after != overrides_before:
+            raise RuntimeError(
+                f"adapter {type(self).__name__}.build_output_state_codec() must be "
+                "declaration-only and cannot materialize or replace components: "
+                f"materialized_before={materialized_before}, "
+                f"materialized_after={materialized_after}, "
+                f"overrides_before={overrides_before}, overrides_after={overrides_after}"
+            )
+        return codec
+
+    @property
+    def output_state_codec(self) -> Optional[OutputStateCodec]:
+        """Return the immutable codec selected during adapter construction.
+
+        Returns:
+            Adapter-owned output codec, or ``None`` for online-only adapters.
+        """
+        return self._output_state_codec
+
+    @property
+    def output_state_encoding_modules(self) -> Tuple[str, ...]:
+        """Return validated component names required for target-media encoding.
+
+        The caller owns component device staging. Keeping this declaration separate
+        from :meth:`encode_output_state` prevents a per-batch encode from implicitly
+        moving or offloading modules behind the trainer's back.
+
+        Returns:
+            Ordered runtime component names required for target encoding.
+        """
+        return self._output_state_encoding_modules
+
+    def build_output_state_codec(self) -> Optional[OutputStateCodec]:
+        """Build the adapter-owned target-media codec, if offline training is supported.
+
+        The component runtime, canonical scheduler, and scheduler group are available
+        before this hook runs. This hook declares lifecycle metadata only: it must not
+        materialize, load, move, replace, or mutate the dtype of any model component.
+        Online-only adapters retain the default ``None``.
+
+        Returns:
+            Adapter-owned output codec, or ``None`` when offline output is unsupported.
+        """
+        return None
+
+    @classmethod
+    def _validated_output_state_codec_unavailable_reason(cls) -> Optional[str]:
+        """Return a normalized offline-codec blocker declared by the adapter."""
+        reason = cls.output_state_codec_unavailable_reason
+        if reason is None:
+            return None
+        if not isinstance(reason, str) or not reason.strip():
+            raise TypeError(
+                f"adapter {cls.__name__}.output_state_codec_unavailable_reason must be "
+                f"a non-empty string or None, received {type(reason).__name__}: {reason!r}"
+            )
+        return reason.strip()
+
+    @classmethod
+    def validate_offline_output_capability(cls) -> None:
+        """Fail before model loading unless this adapter can encode offline targets.
+
+        A concrete codec still validates its realized components during adapter
+        construction. This class-level check covers declarations that can be proven
+        without downloading weights or allocating accelerator memory.
+
+        Returns:
+            None after successful static capability validation.
+
+        Raises:
+            NotImplementedError: If the adapter declares an actionable offline blocker.
+            TypeError: If the contract, codec builder, or geometry hook is missing.
+        """
+        reason = cls._validated_output_state_codec_unavailable_reason()
+        if reason is not None:
+            raise NotImplementedError(
+                f"offline output-state encoding is unavailable for adapter "
+                f"{cls.__name__}: {reason}"
+            )
+        contract = cls.pipeline_io_contract
+        if not isinstance(contract, PipelineIOContract):
+            raise TypeError(
+                f"offline training requires adapter {cls.__name__} to declare a "
+                f"PipelineIOContract, received {type(contract).__name__}: {contract!r}"
+            )
+        if cls.build_output_state_codec is BaseAdapter.build_output_state_codec:
+            raise TypeError(
+                f"offline training requires adapter {cls.__name__} to provide an "
+                "output-state codec through build_output_state_codec()"
+            )
+        if cls._validate_encoded_output_geometry is BaseAdapter._validate_encoded_output_geometry:
+            raise TypeError(
+                f"offline training requires adapter {cls.__name__} to override "
+                "_validate_encoded_output_geometry()"
+            )
+
+    def _validate_output_state_codec_lifecycle(self) -> Tuple[str, ...]:
+        """Validate the adapter's pipeline contract and codec declaration."""
+        unavailable_reason = type(self)._validated_output_state_codec_unavailable_reason()
+        contract = self.effective_pipeline_io_contract
+        if contract is not None and not isinstance(contract, PipelineIOContract):
+            raise TypeError(
+                f"adapter {type(self).__name__} expected pipeline_io_contract to be "
+                f"PipelineIOContract or None, received {type(contract).__name__}: {contract!r}"
+            )
+
+        codec = self.output_state_codec
+        if codec is None:
+            return ()
+        if unavailable_reason is not None:
+            raise ValueError(
+                f"adapter {type(self).__name__} built an output-state codec while declaring "
+                "output_state_codec_unavailable_reason; remove the stale blocker declaration"
+            )
+        if contract is None:
+            raise ValueError(
+                f"adapter {type(self).__name__} built an output-state codec without declaring "
+                "pipeline_io_contract"
+            )
+        return validate_codec_required_components(
+            codec,
+            tuple(self.component_runtime.declared_component_names),
+        )
+
+    def encode_output_state(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Union[Mapping[str, Any], PreparedConditionState],
+        generator: Optional[torch.Generator] = None,
+    ) -> EncodedOutputState:
+        """Encode decoded targets through the adapter-owned validated boundary.
+
+        Args:
+            media_batch: Exact output-media sequence for every batch sample.
+            condition: Cached or already-prepared model-input condition for the
+                same batch.
+            generator: Optional deterministic generator used by stochastic encoders.
+
+        Returns:
+            Detached clean output state using the adapter's latent-storage policy.
+
+        Raises:
+            NotImplementedError: If the adapter declares a known codec blocker.
+            RuntimeError: If the adapter does not expose the complete offline codec seam.
+            TypeError: If condition or generator has the wrong boundary type.
+        """
+        unavailable_reason = type(self)._validated_output_state_codec_unavailable_reason()
+        if unavailable_reason is not None:
+            raise NotImplementedError(
+                f"offline output-state encoding is unavailable for adapter "
+                f"{type(self).__name__}: {unavailable_reason}"
+            )
+        contract = self.effective_pipeline_io_contract
+        if contract is None:
+            raise RuntimeError(
+                f"adapter {type(self).__name__} cannot encode output state because it does not "
+                "declare pipeline_io_contract"
+            )
+        codec = self.output_state_codec
+        if codec is None:
+            raise RuntimeError(
+                f"adapter {type(self).__name__} declares pipeline_io_contract but does not "
+                "provide an output-state codec through build_output_state_codec()"
+            )
+        if generator is not None and not isinstance(generator, torch.Generator):
+            raise TypeError(
+                "expected output-state generator to be torch.Generator or None, "
+                f"received {type(generator).__name__}: {generator!r}"
+            )
+
+        validated_media = validate_output_candidate_batch(media_batch, contract)
+        if isinstance(condition, PreparedConditionState):
+            prepared_condition = condition
+        elif isinstance(condition, Mapping):
+            prepared_condition = self.prepare_condition_state(condition, generator)
+        else:
+            raise TypeError(
+                "expected output-state condition to be Mapping[str, Any] or "
+                "PreparedConditionState, "
+                f"received {type(condition).__name__}: {condition!r}"
+            )
+        codec_condition = prepared_condition.output_codec_condition()
+        with torch.no_grad():
+            encoded = codec.encode_output_state(
+                validated_media,
+                codec_condition,
+                generator,
+            )
+
+        encoded = validate_encoded_output_state(
+            encoded,
+            contract=contract,
+            expected_component_order=self.trajectory_component_order,
+            expected_batch_size=len(validated_media),
+            device=self.device,
+        )
+
+        # Offline targets are trajectory states too. Apply the same storage boundary
+        # as online rollout after first proving that the codec returned detached state;
+        # casting before validation could accidentally hide an attached source tensor.
+        clean_state = self.cast_latent_state(encoded.clean_state)
+        if clean_state is not encoded.clean_state:
+            encoded = EncodedOutputState(
+                clean_state=clean_state,
+                forward_context=encoded.forward_context,
+                decode_context=encoded.decode_context,
+                geometry_signatures=encoded.geometry_signatures,
+            )
+            encoded = validate_encoded_output_state(
+                encoded,
+                contract=contract,
+                expected_component_order=self.trajectory_component_order,
+                expected_batch_size=len(validated_media),
+                device=self.device,
+            )
+
+        self._validate_encoded_output_geometry(validated_media, codec_condition, encoded)
+        return encoded
+
+    def decode_output_state(
+        self,
+        encoded: EncodedOutputState,
+        *,
+        output_type: Literal["pil", "pt", "np"] = "pil",
+    ) -> Any:
+        """Decode one encoded offline state through the adapter's existing decoder.
+
+        ``decode_context`` may contain geometry retained only for validation as well as
+        kwargs required by a particular decoder. This wrapper forwards only names accepted
+        by ``decode_latents`` and supplies the requested output type when that decoder exposes
+        the standard ``output_type`` argument.
+
+        Args:
+            encoded: Validated single-component output state produced by this adapter.
+            output_type: Existing decoder output representation.
+
+        Returns:
+            Model-specific decoded image or video batch.
+
+        Raises:
+            TypeError: If ``encoded`` or ``output_type`` has the wrong boundary type.
+            ValueError: If the state cannot be represented by the legacy single-latent decoder.
+        """
+        if not isinstance(encoded, EncodedOutputState):
+            raise TypeError(
+                "expected encoded output state to be EncodedOutputState, "
+                f"received {type(encoded).__name__}: {encoded!r}"
+            )
+        if type(output_type) is not str:
+            raise TypeError(
+                "expected output_type to be str, "
+                f"received {type(output_type).__name__}: {output_type!r}"
+            )
+        if output_type not in ("pil", "pt", "np"):
+            raise ValueError(
+                "expected output_type in ('pil', 'pt', 'np'), " f"received {output_type!r}"
+            )
+        return self._decode_output_state(encoded, output_type=output_type)
+
+    def _decode_output_state(
+        self,
+        encoded: EncodedOutputState,
+        *,
+        output_type: Literal["pil", "pt", "np"],
+    ) -> Any:
+        """Route the default single-component state through ``decode_latents``."""
+        if encoded.clean_state.component_names != ("latent",):
+            raise ValueError(
+                "default _decode_output_state requires exactly one 'latent' component; "
+                "multi-component adapters must override the protected hook, received "
+                f"{encoded.clean_state.component_names}"
+            )
+        decode_kwargs = filter_kwargs(
+            self.decode_latents,
+            **dict(encoded.decode_context),
+            output_type=output_type,
+        )
+        return self.decode_latents(
+            encoded.clean_state.components["latent"],
+            **decode_kwargs,
+        )
+
+    def _validate_encoded_output_geometry(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        encoded: EncodedOutputState,
+    ) -> None:
+        """Validate codec geometry against adapter-owned input/configuration facts.
+
+        Generic validation can prove that signatures are internally coherent, but it
+        cannot prove that self-reported dimensions agree with configured geometry or
+        input-media-derived constraints. Every adapter that supplies a codec must own
+        that model-specific comparison explicitly.
+        """
+        raise NotImplementedError(
+            f"adapter {type(self).__name__} provides an output-state codec but must override "
+            "_validate_encoded_output_geometry() to validate geometry signatures against "
+            "geometry_source="
+            f"{self.effective_pipeline_io_contract.geometry_source.value!r}"
+        )
+
     # ============================== Loading Components ==============================
     @abstractmethod
     def load_pipeline(self) -> DiffusionPipeline:
@@ -397,6 +925,100 @@ class BaseAdapter(ABC):
             Classic runtime wrapping the subclass's existing ``load_pipeline`` result.
         """
         return ClassicPipelineRuntime(self.load_pipeline())
+
+    def _load_diffusers_pipeline(
+        self,
+        pipeline_class: type,
+        pretrained_model_name_or_path: str,
+        **kwargs: Any,
+    ) -> DiffusionPipeline:
+        """Load an eager Diffusers pipeline with the resolved component dtype policy."""
+        manifest_policy = self._component_load_dtype_manifest
+        user_policy = self._component_load_dtype_overrides
+
+        if isinstance(user_policy, torch.dtype) or (
+            user_policy is None and isinstance(manifest_policy, torch.dtype)
+        ):
+            kwargs.update(
+                {
+                    key: value
+                    for key, value in build_component_load_dtype_kwargs(
+                        user_policy=user_policy,
+                        manifest_policy=manifest_policy,
+                        component_names=(),
+                        transformer_names=(),
+                        text_encoder_names=(),
+                    ).items()
+                    if key not in kwargs
+                }
+            )
+        elif isinstance(user_policy, Mapping) or isinstance(manifest_policy, Mapping):
+            load_config = getattr(pipeline_class, "load_config", None)
+            if not callable(load_config):
+                raise TypeError(
+                    f"adapter {type(self).__name__} expected {pipeline_class.__name__}.load_config "
+                    "to resolve component_load_dtypes mapping"
+                )
+            config_keys = {
+                "cache_dir",
+                "force_download",
+                "proxies",
+                "token",
+                "local_files_only",
+                "revision",
+            }
+            config_kwargs = {key: value for key, value in kwargs.items() if key in config_keys}
+            pipeline_config = load_config(pretrained_model_name_or_path, **config_kwargs)
+            component_names = [
+                name
+                for name, value in pipeline_config.items()
+                if isinstance(value, (list, tuple)) and len(value) >= 2
+            ]
+            # Adapter defaults may cover several checkpoint variants of one pipeline
+            # class. Keep absent class-declared optional components valid for manifest
+            # validation, but resolve the actual dtype mapping only for this checkpoint.
+            manifest_declared_names = list(
+                dict.fromkeys(
+                    [
+                        *component_names,
+                        *getattr(pipeline_class, "_optional_components", ()),
+                    ]
+                )
+            )
+            load_dtype_kwargs = build_component_load_dtype_kwargs(
+                user_policy=user_policy,
+                manifest_policy=manifest_policy,
+                component_names=component_names,
+                transformer_names=[name for name in component_names if "transformer" in name],
+                text_encoder_names=[name for name in component_names if "text_encoder" in name],
+                manifest_declared_names=manifest_declared_names,
+                preserve_unselected=True,
+            )
+            kwargs.update(
+                {key: value for key, value in load_dtype_kwargs.items() if key not in kwargs}
+            )
+
+        return pipeline_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
+
+    def _resolve_component_load_dtype_mapping(
+        self,
+        *,
+        component_names: Sequence[str],
+        transformer_names: Sequence[str],
+        text_encoder_names: Sequence[str],
+    ) -> Dict[str, torch.dtype]:
+        """Resolve adapter defaults and user overrides for explicit loader components."""
+        return component_dtype_mapping(
+            user_policy=getattr(self, "_component_load_dtype_overrides", None),
+            manifest_policy=getattr(
+                self,
+                "_component_load_dtype_manifest",
+                getattr(self, "component_load_dtype_defaults", None),
+            ),
+            component_names=component_names,
+            transformer_names=transformer_names,
+            text_encoder_names=text_encoder_names,
+        )
 
     def load_scheduler(self) -> SDESchedulerMixin:
         """Load and return the scheduler."""
@@ -485,6 +1107,21 @@ class BaseAdapter(ABC):
     def get_component_unwrapped(self, name: str) -> torch.nn.Module:
         """Get the original unwrapped component."""
         return cast(torch.nn.Module, self.component_runtime.get_canonical_component(name))
+
+    def prepare_diffusers_cache(
+        self,
+        policy: str,
+        component_name: str,
+        transformer: torch.nn.Module,
+    ) -> None:
+        """Prepare model-specific compatibility required by a cache policy.
+
+        Args:
+            policy: User-facing diffusers cache policy identifier.
+            component_name: Canonical transformer component name.
+            transformer: Prepared transformer route that will receive the policy.
+        """
+        return None
 
     def get_component_config(self, name: str):
         """Get the config of a component."""
@@ -1325,15 +1962,82 @@ class BaseAdapter(ABC):
         return self._named_parameters[name].ema_wrapper.ema_parameters
 
     # ============================== Gradient Checkpointing ==============================
-    def enable_gradient_checkpointing(self):
-        """Enable gradient checkpointing for target components."""
+    def _gradient_checkpointing_root(self, component: torch.nn.Module) -> torch.nn.Module:
+        """Peel distributed and PEFT wrappers before configuring checkpoint units."""
+        root = self._unwrap(component)
+        get_base_model = getattr(root, "get_base_model", None)
+        if callable(get_base_model):
+            root = get_base_model()
+        if not isinstance(root, torch.nn.Module):
+            raise TypeError(
+                "expected gradient checkpointing root as nn.Module, "
+                f"received {type(root).__name__}: {root!r}"
+            )
+        return root
+
+    def _gradient_checkpointing_units(
+        self,
+        component_name: str,
+        component: torch.nn.Module,
+    ) -> List[CheckpointUnit]:
+        """Return checkpointable blocks in their registered execution order."""
+        del component_name
+        return discover_gradient_checkpointing_units(component)
+
+    @staticmethod
+    def _enable_full_gradient_checkpointing(
+        component_name: str,
+        component: torch.nn.Module,
+    ) -> None:
+        """Bridge Diffusers and Transformers full-checkpointing APIs."""
+        enable = getattr(component, "enable_gradient_checkpointing", None)
+        if callable(enable):
+            enable()
+            return
+        enable = getattr(component, "gradient_checkpointing_enable", None)
+        if callable(enable):
+            enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            return
+        raise TypeError(
+            f"component {component_name!r} ({type(component).__name__}) does not expose "
+            "enable_gradient_checkpointing() or gradient_checkpointing_enable()"
+        )
+
+    def enable_gradient_checkpointing(self) -> None:
+        """Apply the normalized full or selective policy to target components."""
+        policy = self.training_args.enable_gradient_checkpointing
         for comp_name in self.model_args.target_components:
             component = self.get_component(comp_name)
-            if hasattr(component, "enable_gradient_checkpointing"):
-                component.enable_gradient_checkpointing()
-                logger.info(f"Enabled gradient checkpointing for {comp_name}")
-            else:
-                logger.warning(f"{comp_name} does not support gradient checkpointing")
+            root = self._gradient_checkpointing_root(component)
+            if isinstance(policy, bool) or policy.mode == "full":
+                self._enable_full_gradient_checkpointing(comp_name, root)
+                logger.info("Enabled full gradient checkpointing for %s", comp_name)
+                continue
+            if policy.mode == "none":
+                continue
+
+            enable = getattr(root, "enable_gradient_checkpointing", None)
+            if not callable(enable):
+                raise TypeError(
+                    f"selective gradient checkpointing for component {comp_name!r} "
+                    f"requires enable_gradient_checkpointing(custom_func), received "
+                    f"{type(root).__name__}"
+                )
+            units = self._gradient_checkpointing_units(comp_name, root)
+            selected = select_gradient_checkpointing_units(policy, units)
+            enable(selective_gradient_checkpointing_function(selected))
+            logger.info(
+                "Enabled selective gradient checkpointing for %s: mode=%s, selected=%d/%d",
+                comp_name,
+                policy.mode,
+                len(selected),
+                len(units),
+            )
+            logger.debug(
+                "Gradient checkpoint units for %s -> %s",
+                comp_name,
+                [name for name, _ in selected],
+            )
 
     def disable_gradient_checkpointing(self) -> None:
         """Disable checkpointing on every materialized trainable variant."""
@@ -1351,40 +2055,78 @@ class BaseAdapter(ABC):
             if id(component) in seen:
                 continue
             seen.add(id(component))
-            if hasattr(component, "disable_gradient_checkpointing"):
-                component.disable_gradient_checkpointing()
+            root = self._gradient_checkpointing_root(component)
+            disable = getattr(root, "disable_gradient_checkpointing", None)
+            if callable(disable):
+                disable()
                 logger.info("Disabled gradient checkpointing for %s", type(component).__name__)
-            else:
-                logger.warning(
-                    "%s does not support disabling gradient checkpointing",
-                    type(component).__name__,
-                )
+                continue
+            disable = getattr(root, "gradient_checkpointing_disable", None)
+            if callable(disable):
+                disable()
+                logger.info("Disabled gradient checkpointing for %s", type(component).__name__)
+                continue
+            logger.warning(
+                "%s does not support disabling gradient checkpointing",
+                type(component).__name__,
+            )
 
     # ============================== Precision Management ==============================
     def _cast_module_mixed_precision(
         self,
+        name: str,
         component: torch.nn.Module,
         train_dtype: torch.dtype,
         frozen_dtype: Optional[torch.dtype],
+        *,
+        force_uniform_dtype: Optional[torch.dtype] = None,
     ) -> int:
         """
         Set floating-point parameters/buffers without a trainable round-trip through frozen_dtype.
 
         Trainable parameters use ``train_dtype``. Frozen parameters and floating-point buffers use
         ``frozen_dtype`` when it is set, or are left at their loaded dtype when ``frozen_dtype`` is
-        ``None`` (preserve). Integer/bool buffers are left unchanged (same as ``Module.to``).
+        ``None`` (no post-load mutation). Integer/bool buffers are left unchanged.
         """
-        n_trainable = 0
-        for _, param in component.named_parameters():
-            if param.requires_grad:
-                param.data = param.data.to(dtype=train_dtype)
-                n_trainable += 1
-            elif frozen_dtype is not None:
-                param.data = param.data.to(dtype=frozen_dtype)
-        for _, buf in component.named_buffers():
-            if buf.is_floating_point() and frozen_dtype is not None:
-                buf.data = buf.data.to(dtype=frozen_dtype)
-        return n_trainable
+        result = cast_module_role_dtypes(
+            component,
+            component_name=name,
+            trainable_dtype=train_dtype,
+            frozen_dtype=frozen_dtype,
+            force_uniform_dtype=force_uniform_dtype,
+            is_adapter_parameter=lambda parameter_name: any(
+                key in parameter_name for key in self.lora_keys
+            ),
+        )
+        if result.protected:
+            logger.info(
+                "Preserved %d model-protected FP32 parameter/buffer entries in component %r",
+                result.protected,
+                name,
+            )
+        return result.trainable
+
+    def _log_component_precision_inventory(
+        self,
+        name: str,
+        component: torch.nn.Module,
+        *,
+        stage: str,
+    ) -> None:
+        """Log effective trainable/frozen parameter storage after dtype policy."""
+        if not self.accelerator.is_main_process:
+            return
+        inventory = parameter_dtype_inventory(component)
+        rendered = {
+            role: {str(dtype): count for dtype, count in sorted(values.items(), key=str)}
+            for role, values in inventory.items()
+        }
+        logger.info(
+            "Precision inventory stage=%s component=%s %s",
+            stage,
+            name,
+            rendered,
+        )
 
     def _apply_component_precision_policy(
         self,
@@ -1396,61 +2138,46 @@ class BaseAdapter(ABC):
         frozen_dtype = self._frozen_dtype_for_component(name)
         if name in self.model_args.target_components:
             if self._is_fsdp2() and self.accelerator.mixed_precision != "no":
-                component.to(dtype=torch.float32)
-            else:
-                self._cast_module_mixed_precision(component, train_dtype, frozen_dtype)
-        elif frozen_dtype is not None:
-            component.to(dtype=frozen_dtype)
-
-    def _resolved_frozen_component_dtype_policy(
-        self,
-    ) -> tuple[Optional[torch.dtype], dict[str, Optional[torch.dtype]]]:
-        """Resolve scalar or selector-based frozen dtype configuration.
-
-        Concrete component selectors override the two supported component groups,
-        and groups override ``default``. A null value means preserve the loaded
-        checkpoint dtype for that component.
-        """
-        cached = getattr(self, "_frozen_component_dtype_policy_cache", None)
-        if cached is not None:
-            return cached
-
-        configured = getattr(self.model_args, "frozen_parameters_dtype", None)
-        if not isinstance(configured, dict):
-            policy = (configured, {})
-            self._frozen_component_dtype_policy_cache = policy
-            return policy
-
-        default_dtype = configured.get("default")
-        overrides: dict[str, Optional[torch.dtype]] = {}
-        group_selectors = ("transformers", "text_encoders")
-
-        for selector in group_selectors:
-            if selector not in configured:
-                continue
-            for component_name in self._resolve_component_names(selector):
-                overrides[component_name] = configured[selector]
-
-        for selector, component_dtype in configured.items():
-            if selector == "default" or selector in group_selectors:
-                continue
-            component_names = self._resolve_component_names(selector)
-            if len(component_names) != 1 or component_names[0] != selector:
-                raise ValueError(
-                    "expected concrete model.frozen_parameters_dtype selector to "
-                    f"resolve only itself, received selector={selector!r}, "
-                    f"resolved={component_names!r}"
+                self._cast_module_mixed_precision(
+                    name,
+                    component,
+                    train_dtype,
+                    frozen_dtype,
+                    force_uniform_dtype=torch.float32,
                 )
-            overrides[selector] = component_dtype
-
-        policy = (default_dtype, overrides)
-        self._frozen_component_dtype_policy_cache = policy
-        return policy
+            else:
+                self._cast_module_mixed_precision(
+                    name,
+                    component,
+                    train_dtype,
+                    frozen_dtype,
+                )
+        elif frozen_dtype is not None:
+            self._cast_module_mixed_precision(
+                name,
+                component,
+                train_dtype,
+                frozen_dtype,
+                force_uniform_dtype=frozen_dtype,
+            )
+        self._log_component_precision_inventory(name, component, stage="materialize")
 
     def _frozen_dtype_for_component(self, name: str) -> Optional[torch.dtype]:
-        """Return one component's frozen dtype or ``None`` to preserve it."""
-        default_dtype, overrides = self._resolved_frozen_component_dtype_policy()
-        return overrides[name] if name in overrides else default_dtype
+        """Return one component's frozen dtype or ``None`` for no mutation."""
+        policy = getattr(self.model_args, "frozen_parameters_dtype", None)
+        if not getattr(self, "_frozen_dtype_policy_validated", False):
+            validate_dtype_policy_selectors(
+                policy,
+                declared_names=self.component_runtime.declared_component_names,
+            )
+            self._frozen_dtype_policy_validated = True
+        return resolve_component_dtype(
+            name,
+            user_policy=policy,
+            manifest_policy=None,
+            transformer_names=self.transformer_names,
+            text_encoder_names=self.text_encoder_names,
+        )
 
     def _mix_precision(self):
         """Set trainable params to ``trainable_parameters_dtype``; by default leave frozen params
@@ -1461,8 +2188,8 @@ class BaseAdapter(ABC):
 
         Frozen-dtype policy: a scalar ``frozen_parameters_dtype`` applies to every
         component. A mapping resolves concrete component, component-group, then
-        ``default`` values in descending priority. A null resolved value preserves
-        the component's checkpoint dtype.
+        ``default`` values in descending priority. A null resolved value performs
+        no post-load dtype mutation.
 
         FSDP2 caveat: FSDP2 shards each unit with ONE original dtype, and accelerate upcasts the
         trainable params to an fp32 master when ``mixed_precision != 'no'``. So a trained component
@@ -1483,11 +2210,23 @@ class BaseAdapter(ABC):
         if self._is_fsdp2() and self.accelerator.mixed_precision != "no":
             for name in merged_names:
                 if name in target_set:
-                    self.get_component(name).to(dtype=torch.float32)
+                    self._cast_module_mixed_precision(
+                        name,
+                        self.get_component(name),
+                        train_dtype,
+                        self._frozen_dtype_for_component(name),
+                        force_uniform_dtype=torch.float32,
+                    )
                 else:
                     frozen_dtype = self._frozen_dtype_for_component(name)
                     if frozen_dtype is not None:
-                        self.get_component(name).to(dtype=frozen_dtype)
+                        self._cast_module_mixed_precision(
+                            name,
+                            self.get_component(name),
+                            train_dtype,
+                            frozen_dtype,
+                            force_uniform_dtype=frozen_dtype,
+                        )
                 # else: preserve the untrained component's loaded dtype
             frozen_policy = {
                 name: self._frozen_dtype_for_component(name)
@@ -1495,9 +2234,19 @@ class BaseAdapter(ABC):
                 if name not in target_set
             }
             logger.info(
-                "FSDP2: trained components -> fp32 (uniform orig dtype); "
-                f"frozen component policy -> {frozen_policy}"
+                "FSDP2 precision: configured trainable storage=%s, "
+                "effective original/master=torch.float32, compute=%s; "
+                "frozen component policy -> %s",
+                train_dtype,
+                self.accelerator.mixed_precision,
+                frozen_policy,
             )
+            for name in merged_names:
+                self._log_component_precision_inventory(
+                    name,
+                    self.get_component(name),
+                    stage="initialize",
+                )
             return
 
         # Split: trainable -> train_dtype; frozen -> frozen_dtype, or preserved when None.
@@ -1509,16 +2258,31 @@ class BaseAdapter(ABC):
             frozen_policy[name] = frozen_dtype
             if name in target_set:
                 trainable_count += self._cast_module_mixed_precision(
-                    component, train_dtype, frozen_dtype
+                    name,
+                    component,
+                    train_dtype,
+                    frozen_dtype,
                 )
             elif frozen_dtype is not None:
-                component.to(dtype=frozen_dtype)
+                self._cast_module_mixed_precision(
+                    name,
+                    component,
+                    train_dtype,
+                    frozen_dtype,
+                    force_uniform_dtype=frozen_dtype,
+                )
             # else: preserve the fully-frozen component's loaded dtype
 
         if trainable_count > 0:
             logger.info(
                 f"Set {trainable_count} trainable parameters to {train_dtype}; "
                 f"frozen component policy -> {frozen_policy}"
+            )
+        for name in merged_names:
+            self._log_component_precision_inventory(
+                name,
+                self.get_component(name),
+                stage="initialize",
             )
 
     # ============================== LoRA Management ==============================
@@ -1635,18 +2399,6 @@ class BaseAdapter(ABC):
     def _is_fsdp2(self) -> bool:
         """Check if FSDP2 is enabled."""
         return getattr(self.accelerator, "is_fsdp2", False)
-
-    def uses_fsdp_cpu_efficient_loading(self) -> bool:
-        """Return whether FSDP defers weight materialization to rank zero.
-
-        Public because the trainer must know it: under this mode only rank zero
-        holds real weights before ``prepare``, so frozen-component broadcasts and
-        preprocessing loads are ordered around it.
-        """
-        if not self._is_fsdp():
-            return False
-        fsdp_plugin = self.accelerator.state.fsdp_plugin
-        return fsdp_plugin is not None and getattr(fsdp_plugin, "cpu_ram_efficient_loading", False)
 
     # ------------------------------ Shard Strategies ---------------------------------
     def _is_zero3(self) -> bool:
@@ -2898,35 +3650,16 @@ class BaseAdapter(ABC):
                     logger.info(f"Merged LoRA adapter into base model for {comp_name}")
 
     # ============================== Freezing Components ==============================
-    def _freeze_text_encoders(self):
-        """Freeze all text encoders."""
-        for i, encoder in enumerate(self.text_encoders):
-            encoder.requires_grad_(False)
-            encoder.eval()
-
-    def _freeze_vae(self):
-        """Freeze video VAE and audio VAE (if present)."""
-        self.vae.requires_grad_(False)
-        self.vae.eval()
-        if self.audio_vae is not None:
-            self.audio_vae.requires_grad_(False)
-            self.audio_vae.eval()
-
-    def _freeze_transformers(self):
-        """Freeze transformer components (e.g., UNet, ControlNets)."""
-        for name in self.transformer_names:
-            comp = self.get_component(name)
-            if comp is None:
-                continue
-            comp.requires_grad_(False)
-            comp.eval()
-
     def _freeze_components(self):
-        """Freeze strategy using cached target_module_map."""
-        # Freeze everything first
-        self._freeze_text_encoders()
-        self._freeze_vae()
-        self._freeze_transformers()
+        """Freeze each materialized physical root, then reopen logical targets."""
+        seen_roots = set()
+        for root_name in self.component_runtime.materialized_component_names:
+            component = self.component_runtime.get_canonical_component(root_name)
+            if not isinstance(component, nn.Module) or id(component) in seen_roots:
+                continue
+            seen_roots.add(id(component))
+            component.requires_grad_(False)
+            component.eval()
 
         # Selectively unfreeze target components
         for comp_name in self.model_args.target_components:
@@ -3076,6 +3809,9 @@ class BaseAdapter(ABC):
             if name in materialized_after and name not in materialized_before:
                 component = self.component_runtime.get_canonical_component(name)
                 if isinstance(component, torch.nn.Module):
+                    if name not in self.model_args.target_components:
+                        component.requires_grad_(False)
+                        component.eval()
                     self._apply_component_precision_policy(name, component)
         self.component_runtime.load_stage_components(components, device=device or self.device)
 
@@ -3381,6 +4117,20 @@ class BaseAdapter(ABC):
         """
         return bridge.get_replay_callback(self, batch, step_index, field)
 
+    def reference_guidance_kwargs(self, guidance_scale: float) -> Dict[str, object]:
+        """Map the canonical distillation reference guidance onto this adapter's forward.
+
+        Adapters whose forward uses a model-specific guidance name may override this
+        method without exposing that name to trainer code.
+
+        Args:
+            guidance_scale: Guidance strength for the frozen reference score.
+
+        Returns:
+            Forward keyword arguments that apply reference-only guidance.
+        """
+        return {"guidance_scale": guidance_scale}
+
     def get_state_active_numel(self, state: LatentState) -> Mapping[str, int]:
         """Count each component's active stochastic degrees of freedom.
 
@@ -3475,7 +4225,7 @@ class BaseAdapter(ABC):
         self,
         primary_timesteps: torch.Tensor,
         *,
-        batch: Optional[StackedSampleBatch] = None,
+        batch: Optional[Mapping[str, Any]] = None,
     ) -> ComponentTimes:
         """Map one primary scheduler coordinate onto every component's times.
 
@@ -3486,7 +4236,7 @@ class BaseAdapter(ABC):
 
         Args:
             primary_timesteps: Primary scheduler coordinates of shape ``(B,)``.
-            batch: Optional collated batch supplying per-component geometry.
+            batch: Optional online or offline mapping supplying per-component geometry.
 
         Returns:
             Component times whose sigma follows the flow-matching schedule.
@@ -3802,6 +4552,40 @@ class BaseAdapter(ABC):
             active_numel=active_numel,
             state=state,
         )
+
+    def reduce_flow_matching_objective_values(
+        self,
+        values: Mapping[str, torch.Tensor],
+        *,
+        state: Optional[LatentState] = None,
+    ) -> torch.Tensor:
+        """Reduce offline flow-matching errors to one scalar per sample.
+
+        This objective-specific boundary is deliberately separate from the
+        trajectory-wide element-weighted reducer used by online policy and
+        distillation algorithms. Most adapters inherit the existing global
+        reduction unchanged; multi-modal training recipes may override the
+        protected hook without changing rollout likelihood semantics.
+
+        Args:
+            values: Per-element squared errors in component order.
+            state: Noised state supplying active masks.
+
+        Returns:
+            One flow-matching objective value per batch sample.
+        """
+        batch_size = bridge.validate_reduction_inputs(self, values, state)
+        reduced = self._reduce_flow_matching_objective_values(values, state=state)
+        return bridge.validate_reduced_latent_values(self, reduced, batch_size)
+
+    def _reduce_flow_matching_objective_values(
+        self,
+        values: Mapping[str, torch.Tensor],
+        *,
+        state: Optional[LatentState] = None,
+    ) -> torch.Tensor:
+        """Use the existing globally element-weighted reduction by default."""
+        return self.reduce_latent_values(values, state=state)
 
     # ======================================= Sampling & Training =======================================
     @abstractmethod

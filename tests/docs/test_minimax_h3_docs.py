@@ -26,18 +26,18 @@ def _text(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
 
 
-def test_readme_documents_h3_links_pin_and_limits() -> None:
+def test_readme_documents_h3_links_dependency_and_limits() -> None:
     text = _text("README.md")
     assert (
         "The configurations under `examples/` have been verified to yield measurable "
         "performance gains."
     ) not in text
-    assert "Validation status varies by example" in text
-    assert "hardware and reward-trend evidence" in text
-    assert "MiniMax H3 T2VA has real-weight LoRA validation" in text
-    assert "FL2VA and Ref2VA remain" in text
+    assert "all 120 model/backend/algorithm cells" in text
+    assert "smoke completion is not a claim of" in text
+    assert "all 36 real-weight smoke cells" in text
+    assert "FL2VA first-plus-last" in text
     assert "T2VA is real-weight validated on 1 and 16 GPUs" not in text
-    assert text.count("<td>30B</td>") == 3
+    assert text.count("<td>33B</td>") == 3
 
     for model_type, link in zip(
         ("minimax-h3-t2va", "minimax-h3-fl2va", "minimax-h3-ref2va"),
@@ -48,9 +48,9 @@ def test_readme_documents_h3_links_pin_and_limits() -> None:
         assert (ROOT / link).is_file()
 
     for required in (
-        "4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db",
+        "diffusers>=0.40.0",
         "pip install -e .",
-        "PyAV >=18.0.0",
+        "PyAV >=17.0.0",
         "B=1",
         "no CFG",
         "shift 12",
@@ -58,9 +58,8 @@ def test_readme_documents_h3_links_pin_and_limits() -> None:
         "data-ward velocity",
         "N transitions",
         "N + 1 states",
-        "30B",
-        "completed long-run reward trend is not claimed",
-        "pip install 'diffusers @ git+https://github.com/huggingface/diffusers.git@",
+        "33B",
+        "do not claim a completed long-run reward trend",
         "[Datasets](guidance/datasets.md)",
     ):
         assert required in text
@@ -72,13 +71,85 @@ def test_examples_readme_links_h3_and_separates_validation_levels() -> None:
         relative_link = f"../{root_link}"
         assert relative_link in text
         assert (ROOT / root_link).is_file()
-    assert "Schema/API validated only" in text
-    assert "hardware" in text
+    assert "all 36 H3 main cells" in text
+    assert "GPU validation matrix" in text
+    assert "execution coverage" in text
     assert "reward" in text
     assert "61 GB" in text
     assert "ImageBind" in text
     assert "facebookresearch/ImageBind.git" in text
     assert "NonCommercial" in text
+
+
+def test_h3_first_block_cache_docs_preserve_support_and_validation_boundaries() -> None:
+    acceleration = _text("guidance/acceleration.md")
+    knowledge = _text(".agents/knowledge/topics/minimax_h3.md")
+    example = _text("examples/tdm/lora/minimax_h3_t2va/default.yaml")
+
+    for required in (
+        "supported_diffusers_cache_policies",
+        "prepare_diffusers_cache(policy, component_name, transformer)",
+        "MiniMax H3 T2VA/FL2VA/Ref2VA",
+        "`first_block` only",
+        "H3 FirstBlockCache cannot be",
+        "forced-grad rollout path",
+        "threshold is workload-dependent",
+    ):
+        assert required in acceleration
+    for required in (
+        "actual unwrapped main-block class",
+        "transformer_ref",
+        "CPU cache-hit/reset test",
+        "remain workload-dependent",
+    ):
+        assert required in knowledge
+    assert "# acceleration:" in example
+    assert "#     - name: diffusers_cache" in example
+    assert "#       params: { policy: first_block, threshold: 0.05 }" in example
+
+
+def test_gpu_validation_matrix_declares_scope_and_completed_result() -> None:
+    text = _text("guidance/gpu_validation.md")
+
+    assert "10 x 3 x 4 = 120 jobs" in text
+    for result in ("144/144", "120/120", "22/22", "2/2", "132/132"):
+        assert result in text
+    assert "Four positive Muon jobs passed" in text
+    for mode in (
+        "sd35-t2i",
+        "bagel-mri2i",
+        "wan-t2v",
+        "wan-i2v-first",
+        "wan-flf2v",
+        "ltx2-t2av",
+        "ltx2-i2av",
+        "h3-t2va",
+        "h3-fl2va",
+        "h3-ref2va",
+    ):
+        assert f"`{mode}`" in text
+    for backend in ("ddp", "zero2", "fsdp2"):
+        assert f"`{backend}`" in text
+    for algorithm in ("grpo", "sft", "offline-dpo", "tdm"):
+        assert f"`{algorithm}`" in text
+    assert "exactly two rank-local dataloader batches" in text
+    assert "two training epochs" in text
+    assert "eval.eval_freq: 0" in text
+    assert "DistributedSampler" in text
+    assert "Wan-AI/Wan2.1-FLF2V-14B-720P-diffusers" in text
+    assert "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers` | ordered first and last" not in text
+    assert "| Wan first/last | `Wan2.2-I2V-A14B-Diffusers` |" in text
+
+
+def test_install_docs_use_the_released_diffusers_runtime() -> None:
+    readme = _text("README.md")
+    dockerfile = _text("docker/docker-cuda/Dockerfile")
+    docker_readme = _text("docker/README.md")
+
+    assert "diffusers>=0.40.0" in readme
+    assert "pip install -e ./diffusers" not in readme
+    assert "pip install -e ./diffusers" not in dockerfile
+    assert "submodule (required)" not in docker_readme
 
 
 def test_new_model_guide_documents_component_runtime_boundaries() -> None:

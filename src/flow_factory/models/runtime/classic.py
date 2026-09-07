@@ -52,6 +52,25 @@ class ClassicPipelineRuntime(ComponentRuntime):
     def _get_materialized_component(self, name: str) -> Any:
         return getattr(self.pipeline, name, None)
 
+    def physical_route(self, name: str) -> tuple[str, tuple[str, ...]]:
+        """Collapse logical aliases that reference one canonical module object.
+
+        Args:
+            name: Declared logical component name to resolve.
+
+        Returns:
+            Canonical root name and an empty nested path. A declared null component retains its
+            own logical root rather than aliasing through the ``None`` singleton.
+        """
+        self._validate_declared_names([name])
+        component = self.declared_components[name]
+        if component is None:
+            return name, ()
+        for canonical_name, canonical_component in self.canonical_components.items():
+            if component is canonical_component:
+                return canonical_name, ()
+        return name, ()
+
     def _materialize_components(self, names: List[str]) -> None:
         missing = [
             name

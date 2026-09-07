@@ -33,11 +33,17 @@ from typing import (
 import torch
 from accelerate import Accelerator
 
+from ...contracts.execution import (
+    ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT,
+    ExecutionContract,
+)
 from ...hparams import Arguments, DMD2TrainingArguments
 from ...hparams.training_args.dmd2 import DMD2_DEFAULT_OPTIMIZERS
 from ...models.abc import BaseAdapter
-from ...samples import BaseSample, ComponentTimes, LatentState, StackedSampleBatch
+from ...models.trajectory_bridge import resolve_replay_projection_times
 from ...rewards import BaseRewardModel
+from ...samples import BaseSample, ComponentTimes, LatentState, StackedSampleBatch
+from ...utils.noise_schedule import TIMESTEP_MAX, validate_flow_match_coordinates
 from ..abc import BaseTrainer
 from .distillation_runtime import (
     as_role_microbatches,
@@ -66,6 +72,7 @@ class DMD2Trainer(BaseTrainer):
     """Optimize a deterministic few-step generator without real training data."""
 
     paradigm: ClassVar[Literal["distillation"]] = "distillation"
+    execution_contract: ClassVar[ExecutionContract] = ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT
 
     def _optimizer_args_for_role(self, role_name: str):
         """Resolve this role's optimizer, falling back to DMD2's published defaults.
@@ -96,7 +103,7 @@ class DMD2Trainer(BaseTrainer):
         self.training_args: DMD2TrainingArguments
         self._validate_generation_schedule()
         self._rollout_data_iter: Optional[Iterator[Any]] = None
-        self._rollout_dataloader_epoch = 0
+        self._rollout_batches_consumed: Optional[int] = None
         non_ode = {
             name: scheduler.dynamics_type
             for name, scheduler in self.adapter.scheduler_group.items()
@@ -264,9 +271,7 @@ class DMD2Trainer(BaseTrainer):
         if getattr(self, "_boundary_draw_seed", None) != scheduler_seed:
             self._boundary_draw_seed = scheduler_seed
             self._boundary_draw_count = 0
-        step_index = self.adapter.scheduler_group.sample_ode_step_index(
-            self._boundary_draw_count
-        )
+        step_index = self.adapter.scheduler_group.sample_ode_step_index(self._boundary_draw_count)
         self._boundary_draw_count += 1
         num_steps = int(self.training_args.num_inference_steps)
         if step_index >= num_steps:
@@ -368,6 +373,23 @@ class DMD2Trainer(BaseTrainer):
         trajectory before its velocity is used to form the clean prediction.
         """
         replay_step = self.adapter.get_replay_step(batch, boundary_index - 1)
+        if replay_step.times.sigma is not None:
+            expected_order = self.adapter.trajectory_component_order
+            if (
+                tuple(replay_step.times.timestep) != expected_order
+                or tuple(replay_step.times.sigma) != expected_order
+            ):
+                raise ValueError(
+                    "DMD2 stored projection coordinates expected component order "
+                    f"{expected_order}, received timestep={tuple(replay_step.times.timestep)} "
+                    f"and sigma={tuple(replay_step.times.sigma)}"
+                )
+            for name in expected_order:
+                validate_flow_match_coordinates(
+                    replay_step.times.timestep[name],
+                    replay_step.times.sigma[name],
+                    identifier=f"DMD2 stored projection coordinates for component {name!r}",
+                )
         with self.adapter.use_component_variant("generator"):
             with self.autocast():
                 output = self.adapter.replay_generator_boundary(
@@ -379,9 +401,9 @@ class DMD2Trainer(BaseTrainer):
                     **self._replay_forward_kwargs(batch),
                 )
         velocity = require_velocity(output, algorithm_name="DMD2", role_name="generator")
-        primary_name = self.adapter.trajectory_component_order[0]
-        projection_times = self.adapter.build_training_component_times(
-            replay_step.times.timestep[primary_name],
+        projection_times = resolve_replay_projection_times(
+            self.adapter,
+            replay_step.times,
             batch=batch,
         )
         return self.adapter.project_velocity_to_clean_state(
@@ -405,7 +427,7 @@ class DMD2Trainer(BaseTrainer):
             dtype=torch.float32,
         )
         sigma = lower + (upper - lower) * sigma
-        primary_timesteps = sigma * 1000.0
+        primary_timesteps = sigma * TIMESTEP_MAX
         return self.adapter.build_training_component_times(primary_timesteps, batch=batch)
 
     def _replay_forward_kwargs(self, batch: StackedSampleBatch) -> Dict[str, object]:
@@ -414,4 +436,4 @@ class DMD2Trainer(BaseTrainer):
 
     def _reference_forward_kwargs(self, batch: StackedSampleBatch) -> Dict[str, object]:
         """Return forward arguments for the real score, which alone may be guided."""
-        return reference_forward_kwargs(self.training_args, batch)
+        return reference_forward_kwargs(self.adapter, self.training_args, batch)

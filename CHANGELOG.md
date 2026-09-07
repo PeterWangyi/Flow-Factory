@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — SenseNova-U1
+
+- Added SenseNova-U1 1.0/1.5 T2I and ordered variable-count multi-reference
+  I2I support through the unified NEO-Unify adapter.
+- Added GRPO recipes for OCR T2I and PickScore multi-reference I2I.
+- See [PR #217](https://github.com/X-GenGroup/Flow-Factory/pull/217).
+
+---
+
 ## Unreleased — `feature/structured-trajectory-runtime`
 
 - Added structured multi-component trajectories, ordered heterogeneous references,
@@ -9,6 +18,8 @@
   responsibilities into focused runtime modules.
 - Added packed distributed metric/sample collectives with benchmark-gated fallbacks.
 - Added scalar or selector-based `frozen_parameters_dtype` policies.
+- Added adapter defaults and scalar/selector overrides for load-time component dtypes.
+- Added physical-root load planning and backend-owned target/auxiliary/reward lifecycles.
 
 ### Breaking changes
 

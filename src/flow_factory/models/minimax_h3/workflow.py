@@ -14,7 +14,7 @@
 
 """Own MiniMax H3 workflow loading, setup, and execution contracts."""
 
-import os
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import torch
@@ -25,10 +25,15 @@ from ...samples import (
     MiniMaxH3FL2VASample,
     MiniMaxH3Ref2VASample,
     MiniMaxH3T2VASample,
+    MultiModalStepOutput,
     StructuredTrajectory,
 )
 from ...scheduler import MiniMaxH3SDEScheduler, SchedulerGroup
 from ..runtime import ModularPipelineRuntime
+from ._chunking import (
+    install_h3_attention_norm_chunking,
+    install_h3_feed_forward_chunking,
+)
 from ._common import (
     build_structured_trajectories,
 )
@@ -36,20 +41,13 @@ from ._common import build_training_component_times as build_h3_component_times
 from ._common import (
     validate_target_state,
 )
+from ._diffusers_cache import h3_diffusers_cache_context, reset_h3_diffusers_cache
 from .blocks import encode_h3_workflow_inputs, prepare_h3_rollout_state
 from .decoding import decode_h3_targets
 from .denoise import forward_h3_state
 from .dependency import require_minimax_h3_support
 from .layout import build_h3_schedule_plan
 
-_COMMON_REQUIRED_COMPONENTS = (
-    "scheduler",
-    "text_encoder",
-    "tokenizer",
-    "processor",
-    "vae",
-    "audio_vae",
-)
 _COMPONENT_ORDER = ("video", "audio")
 _LAYOUT_MATRIX_FIELDS = ("position_ids",)
 _LAYOUT_INDEX_FIELDS = (
@@ -82,55 +80,44 @@ def load_h3_workflow_pipeline(
     model_name_or_path: str,
     *,
     workflow: str,
-    transformer_component_name: str,
 ) -> Any:
-    """Load and validate one workflow-pruned MiniMax H3 pipeline."""
+    """Load a workflow-pruned H3 pipeline from a local directory or Hub repo."""
     symbols = require_minimax_h3_support()
-    pipeline = symbols.MiniMaxH3ModularPipeline.from_pretrained(
+    pipeline = symbols.ModularPipeline.from_pretrained(
         model_name_or_path,
         workflow=workflow,
     )
-    if os.path.isdir(model_name_or_path):
-        component_specs = getattr(pipeline, "_component_specs", None)
-        if not isinstance(component_specs, dict):
-            raise TypeError(
-                f"MiniMax H3 local workflow={workflow!r} expected authoritative "
-                f"pipeline._component_specs dict, received {type(component_specs).__name__}"
-            )
-        for component_name in pipeline.pretrained_component_names:
-            component_spec = component_specs.get(component_name)
-            if component_spec is None or not hasattr(
-                component_spec, "pretrained_model_name_or_path"
-            ):
-                raise TypeError(
-                    f"MiniMax H3 local workflow={workflow!r} expected pretrained "
-                    f"ComponentSpec for {component_name!r}, received {component_spec!r}"
-                )
-            component_spec.pretrained_model_name_or_path = model_name_or_path
-            component_spec.revision = None
-    declared_specs = ModularPipelineRuntime(pipeline).canonical_components
-
-    opposite_component_name = (
-        "transformer_ref" if transformer_component_name == "transformer" else "transformer"
-    )
-    required_names = (*_COMMON_REQUIRED_COMPONENTS, transformer_component_name)
-    missing_names = [name for name in required_names if declared_specs.get(name) is None]
-    opposite_names = [opposite_component_name] if opposite_component_name in declared_specs else []
-    if missing_names or opposite_names:
-        raise ValueError(
-            f"MiniMax H3 workflow={workflow!r} expected required components "
-            f"{required_names!r} and opposite transformer partition {opposite_component_name!r} "
-            f"to be absent, received missing={missing_names!r}, "
-            f"opposite_present={opposite_names!r}, declared={tuple(declared_specs)!r}"
-        )
+    if Path(model_name_or_path).is_dir():
+        # Hub snapshots retain their original repo ID inside each ComponentSpec.
+        # Point only those sources at the local snapshot so load_components()
+        # reads its subfolders from disk instead of downloading them again.
+        for name in pipeline.pretrained_component_names:
+            spec = pipeline._component_specs[name]
+            spec.pretrained_model_name_or_path = model_name_or_path
+            spec.revision = None
     return pipeline
 
 
 def build_h3_component_runtime(adapter: Any) -> ModularPipelineRuntime:
-    """Wrap one pruned pipeline and materialize only its training transformer."""
+    """Build the pruned runtime and prepare the H3 transformer for bounded execution.
+
+    Args:
+        adapter: H3 adapter that declares the target transformer and loads the modular pipeline.
+
+    Returns:
+        Runtime with the training transformer materialized and its feed-forward and attention
+        normalization operations configured for bounded token chunks.
+
+    Raises:
+        ValueError: If the adapter targets components outside the H3 training contract.
+        TypeError: If the materialized transformer structure cannot accept the required chunking.
+    """
     validate_h3_target_components(adapter)
-    runtime = ModularPipelineRuntime(adapter.load_pipeline())
+    runtime = ModularPipelineRuntime.from_adapter(adapter, adapter.load_pipeline())
     runtime.materialize_components([adapter.transformer_component_name])
+    transformer = runtime.get_component(adapter.transformer_component_name)
+    install_h3_feed_forward_chunking(transformer)
+    install_h3_attention_norm_chunking(transformer)
     return runtime
 
 
@@ -181,17 +168,6 @@ def validate_h3_target_components(adapter: Any) -> None:
         )
 
 
-def freeze_h3_setup_components(adapter: Any) -> None:
-    """Freeze or unfreeze only the explicitly materialized training transformer."""
-    target_name = adapter.transformer_component_name
-    trainable_modules = adapter.target_module_map[target_name]
-    if adapter.model_args.finetune_type == "lora":
-        trainable_modules = None
-    adapter._freeze_component(target_name, trainable_modules=trainable_modules)
-    if trainable_modules:
-        adapter.get_component(target_name).train()
-
-
 def map_h3_training_component_times(
     adapter: Any, primary_timesteps: torch.Tensor
 ) -> ComponentTimes:
@@ -215,10 +191,11 @@ def preprocess_h3_workflow(adapter: Any, **kwargs: Any) -> Dict[str, Any]:
         "num_frames": kwargs["num_frames"],
     }
     if adapter.workflow == "fl2va":
-        images = _validate_fl2va_condition_images(kwargs, "preprocess")
-        values["image"] = images[0]
-        if len(images) == 2:
-            values["last_image"] = images[1]
+        first_image, last_image = _validate_fl2va_condition_images(kwargs, "preprocess")
+        if first_image is not None:
+            values["image"] = first_image
+        if last_image is not None:
+            values["last_image"] = last_image
     elif adapter.workflow == "ref2va":
         references = _single_outer_value(kwargs.get("references"), "references", adapter.workflow)
         values["references"] = _build_pinned_references(references)
@@ -258,8 +235,18 @@ def infer_h3_workflow(adapter: Any, **kwargs: Any) -> List[Any]:
     _validate_public_no_cfg_inputs(adapter.workflow, kwargs, "inference")
     _validate_workflow_media_inputs(adapter.workflow, kwargs, "inference")
     condition_images = None
+    condition_image_slots = None
     if adapter.workflow == "fl2va":
-        condition_images = _validate_fl2va_condition_images(kwargs, "inference")
+        first_image, last_image = _validate_fl2va_condition_images(kwargs, "inference")
+        condition_images = tuple(image for image in (first_image, last_image) if image is not None)
+        condition_image_slots = tuple(
+            slot
+            for slot, image in (
+                ("first_frame", first_image),
+                ("last_frame", last_image),
+            )
+            if image is not None
+        )
     prompt = kwargs.get("prompt")
     prompt_value = _single_outer_value(prompt, "prompt", adapter.workflow)
     prompt_embeds = kwargs["prompt_embeds"]
@@ -272,6 +259,7 @@ def infer_h3_workflow(adapter: Any, **kwargs: Any) -> List[Any]:
     geometry = _normalize_geometry(kwargs)
     generator = kwargs.get("generator")
     transformer = adapter.get_component(adapter.transformer_component_name)
+    reset_h3_diffusers_cache(transformer, workflow=adapter.workflow)
     rollout_values = dict(kwargs)
     rollout_values.update(layout)
     rollout_values.update(geometry)
@@ -464,6 +452,11 @@ def infer_h3_workflow(adapter: Any, **kwargs: Any) -> List[Any]:
             },
             "layout": layout,
             "geometry": geometry,
+            **(
+                {}
+                if condition_image_slots is None
+                else {"condition_image_slots": condition_image_slots}
+            ),
         },
     )
     return [sample]
@@ -520,42 +513,97 @@ def forward_h3_adapter_state(
             f"received prompt B={prompt_embeds.shape[0]}"
         )
     layout = _normalize_layout({"layout": forward_kwargs["layout"]})
-    return forward_h3_state(
-        adapter.get_component(adapter.transformer_component_name),
-        state,
-        condition_prefixes,
-        prompt_embeds,
-        times,
-        layout,
-        adapter.scheduler,
-        adapter.audio_scheduler,
-        next_state=next_state,
-        generator=forward_kwargs.get("generator"),
-        noise_level=noise_level,
-        compute_log_prob=compute_log_prob,
-        attention_kwargs=forward_kwargs.get("attention_kwargs"),
-        return_kwargs=return_fields,
-        workflow=adapter.workflow,
+    velocity_only = (
+        not compute_log_prob and next_state is None and tuple(return_fields) == ("velocity",)
     )
+    transformer = adapter.get_component(adapter.transformer_component_name)
+    with h3_diffusers_cache_context(transformer, workflow=adapter.workflow):
+        result = forward_h3_state(
+            transformer,
+            state,
+            condition_prefixes,
+            prompt_embeds,
+            times,
+            layout,
+            adapter.scheduler,
+            adapter.audio_scheduler,
+            next_state=next_state,
+            generator=forward_kwargs.get("generator"),
+            noise_level=noise_level,
+            compute_log_prob=compute_log_prob,
+            velocity_only=velocity_only,
+            attention_kwargs=forward_kwargs.get("attention_kwargs"),
+            return_kwargs=return_fields,
+            workflow=adapter.workflow,
+        )
+    if velocity_only:
+        if not isinstance(result, LatentState):
+            raise TypeError(
+                "MiniMax H3 velocity-only forward expected LatentState, "
+                f"received {type(result).__name__}"
+            )
+        return MultiModalStepOutput(velocity=result)
+    return result
 
 
-def build_h3_replay_forward_kwargs(forward_kwargs: Mapping[str, Any]) -> Dict[str, Any]:
+def build_h3_replay_forward_kwargs(
+    forward_kwargs: Mapping[str, Any],
+    *,
+    state: Optional[LatentState] = None,
+    workflow: Optional[str] = None,
+) -> Dict[str, Any]:
     """Select the conditioning arguments H3 ``forward`` accepts from a replay batch.
 
     Replay wrappers receive every collated batch field, while ``forward`` is a strict
-    public boundary. Selecting here keeps that boundary strict for rollout callers.
+    public boundary. Offline T2VA cache rows retain their authoritative layout as flat
+    input fields and have no condition latents. This binder nests that layout and builds
+    empty prefixes from the current state, so storage casts cannot leave prefix dtype or
+    device stale. Online replay already supplies both nested fields and keeps that path.
 
     Args:
         forward_kwargs: Conditioning arguments resolved from the stored batch.
+        state: Current target state, required to bind missing T2VA prefixes.
+        workflow: H3 workflow identifier, required when prefixes are missing.
 
     Returns:
         Conditioning arguments accepted by ``forward``.
     """
-    return {
+    selected = {
         name: value
         for name, value in forward_kwargs.items()
         if name in _H3_FORWARD_CONDITIONING_FIELDS
     }
+    if "layout" not in selected:
+        layout = _normalize_layout(forward_kwargs)
+        required_layout_fields = (
+            *_LAYOUT_MATRIX_FIELDS,
+            *_LAYOUT_INDEX_FIELDS,
+            *_LAYOUT_COUNT_FIELDS,
+        )
+        missing = tuple(field for field in required_layout_fields if field not in layout)
+        if missing:
+            raise ValueError(
+                f"MiniMax H3 workflow={workflow!r} replay flat layout missing fields={missing}"
+            )
+        selected["layout"] = layout
+
+    if "condition_prefixes" not in selected:
+        if workflow != "t2va":
+            raise ValueError(
+                f"MiniMax H3 workflow={workflow!r} replay requires a shared, reproducible "
+                "conditioned-prefix binder"
+            )
+        if not isinstance(state, LatentState):
+            raise TypeError(
+                "MiniMax H3 T2VA replay requires LatentState to bind empty prefixes, "
+                f"received {type(state).__name__}"
+            )
+        validate_target_state(state)
+        selected["condition_prefixes"] = {
+            component: values.new_empty((values.shape[0], 0, values.shape[-1]))
+            for component, values in state.components.items()
+        }
+    return selected
 
 
 def forward_h3_adapter(adapter: Any, **kwargs: Any) -> Any:
@@ -611,20 +659,22 @@ def _build_pinned_references(entries: Sequence[Mapping[str, Any]]) -> List[Any]:
     symbols = require_minimax_h3_support()
     references = []
     for entry in entries:
-        kind = entry["kind"]
-        if kind == "image":
+        reference_type = entry["type"]
+        if reference_type == "image":
             references.append(symbols.ImageReference(image=entry["media"]))
-        elif kind == "video":
+        elif reference_type == "video":
             reference_kwargs = {"frames": entry["frames"], "fps": entry["fps"]}
             if entry.get("audio") is not None:
                 reference_kwargs.update(audio=entry["audio"], sample_rate=entry["sample_rate"])
             references.append(symbols.VideoReference(**reference_kwargs))
-        elif kind == "audio":
+        elif reference_type == "audio":
             references.append(
                 symbols.AudioReference(audio=entry["media"], sample_rate=entry["sample_rate"])
             )
         else:
-            raise ValueError(f"expected image/video/audio reference kind, received {kind!r}")
+            raise ValueError(
+                f"expected image/video/audio reference type, received {reference_type!r}"
+            )
     return references
 
 
@@ -723,23 +773,63 @@ def _validate_public_no_cfg_inputs(workflow: str, values: Mapping[str, Any], bou
         )
 
 
-def _validate_fl2va_condition_images(values: Mapping[str, Any], boundary: str) -> Sequence[Any]:
+def _validate_fl2va_condition_images(
+    values: Mapping[str, Any],
+    boundary: str,
+) -> tuple[Any | None, Any | None]:
+    direct_first = values.get("image")
+    direct_last = values.get("last_image")
     outer_images = values.get("images")
     if outer_images is None:
         outer_images = values.get("condition_images")
+    if (direct_first is not None or direct_last is not None) and outer_images is not None:
+        raise ValueError(
+            "MiniMax H3 workflow='fl2va' cannot combine direct image/last_image "
+            "arguments with grouped images"
+        )
+    if direct_first is not None or direct_last is not None:
+        return direct_first, direct_last
+
     images = _single_outer_value(outer_images, "images", "fl2va")
     if not isinstance(images, (list, tuple)) or not 1 <= len(images) <= 2:
         raise ValueError(
             f"MiniMax H3 workflow='fl2va' public {boundary} field='images' expected "
             f"one or two ordered images, received {images!r}"
         )
-    return images
+    outer_slots = values.get("image_slots")
+    if outer_slots is None:
+        slots = ("first_frame", "last_frame")[: len(images)]
+    else:
+        slots = _single_outer_value(outer_slots, "image_slots", "fl2va")
+        if not isinstance(slots, (list, tuple)) or len(slots) != len(images):
+            raise ValueError(
+                f"MiniMax H3 workflow='fl2va' public {boundary} field='image_slots' "
+                f"expected {len(images)} slot(s), received {slots!r}"
+            )
+        slots = tuple(slots)
+    if len(set(slots)) != len(slots) or any(
+        slot not in ("first_frame", "last_frame") for slot in slots
+    ):
+        raise ValueError(
+            f"MiniMax H3 workflow='fl2va' public {boundary} field='image_slots' "
+            f"expected unique first_frame/last_frame values, received {slots!r}"
+        )
+    bound = dict(zip(slots, images))
+    return bound.get("first_frame"), bound.get("last_frame")
 
 
 def _validate_workflow_media_inputs(
     workflow: str, values: Mapping[str, Any], boundary: str
 ) -> None:
-    media_fields = ("images", "condition_images", "videos", "audios", "references")
+    media_fields = (
+        "images",
+        "condition_images",
+        "image",
+        "last_image",
+        "videos",
+        "audios",
+        "references",
+    )
     present = {
         field for field in media_fields if field in values and _media_value_present(values[field])
     }
@@ -748,7 +838,14 @@ def _validate_workflow_media_inputs(
             f"MiniMax H3 workflow='t2va' {boundary} rejects media fields={tuple(sorted(present))}"
         )
     if workflow == "ref2va":
-        generic = present & {"images", "condition_images", "videos", "audios"}
+        generic = present & {
+            "images",
+            "condition_images",
+            "image",
+            "last_image",
+            "videos",
+            "audios",
+        }
         if generic:
             raise ValueError(
                 f"MiniMax H3 workflow='ref2va' {boundary} rejects generic media "
@@ -887,7 +984,13 @@ def _normalize_layout(values: Mapping[str, Any]) -> Dict[str, Any]:
                 f"MiniMax H3 layout field={field!r} expected shape (N,D) or "
                 f"collated (B=1,N,D), received {tuple(value.shape)}"
             )
-        normalized[field] = value
+        if value.dtype not in (torch.float32, torch.float64):
+            raise ValueError(
+                f"MiniMax H3 layout field={field!r} expected dtype float32 or float64, "
+                f"received {value.dtype}"
+            )
+        # HF Dataset's torch formatter downcasts cached float64 coordinates.
+        normalized[field] = value.to(dtype=torch.float64)
     for field in _LAYOUT_INDEX_FIELDS:
         if field not in source:
             continue
@@ -946,6 +1049,10 @@ def _normalize_b1_integer(value: Any, field: str) -> int:
 def _decoded_video_sample(video: Any) -> Any:
     if isinstance(video, torch.Tensor) and video.shape[0] == 1:
         return video[0]
-    if isinstance(video, list) and len(video) == 1 and isinstance(video[0], list):
+    if (
+        isinstance(video, list)
+        and len(video) == 1
+        and (video[0] is None or isinstance(video[0], list))
+    ):
         return video[0]
     return video

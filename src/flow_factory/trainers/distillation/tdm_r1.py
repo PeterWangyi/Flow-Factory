@@ -22,6 +22,7 @@ from typing import Any, ClassVar, List, Literal, Optional, Sequence
 import torch
 from accelerate import Accelerator
 
+from ...contracts.execution import ONLINE_EXECUTION_CONTRACT, ExecutionContract
 from ...hparams import Arguments, TDMR1TrainingArguments
 from ...hparams.training_args.tdm_r1 import TDM_R1_DEFAULT_OPTIMIZERS
 from ...models.abc import BaseAdapter
@@ -34,6 +35,7 @@ from .distillation_runtime import (
     query_score_velocity,
     record_distillation_metric,
     require_velocity,
+    resolve_rollout_accumulation_steps,
     role_repeat_progress,
     run_role_phase,
 )
@@ -49,6 +51,7 @@ class TDMR1Trainer(TDMTrainer):
     """Reinforce deterministic TDM trajectories through a frozen-reference surrogate."""
 
     paradigm: ClassVar[Literal["decoupled"]] = "decoupled"
+    execution_contract: ClassVar[ExecutionContract] = ONLINE_EXECUTION_CONTRACT
 
     def _optimizer_args_for_role(self, role_name: str):
         """Resolve this role's optimizer, falling back to TDM-R1's published defaults.
@@ -77,6 +80,11 @@ class TDMR1Trainer(TDMTrainer):
     ) -> None:
         super().__init__(accelerator=accelerator, config=config, adapter=adapter)
         self.training_args: TDMR1TrainingArguments
+
+    def _initialize_snapshots(self) -> None:
+        """Declare the slow surrogate before exact-state compatibility preflight."""
+        super()._initialize_snapshots()
+        self.adapter.declare_variant_snapshot("surrogate", SLOW_SURROGATE_SNAPSHOT)
 
     def _init_reward_model(self):
         """Use train-time rewards instead of TDM's reward-free runtime."""
@@ -111,31 +119,32 @@ class TDMR1Trainer(TDMTrainer):
         """Run fake TTUR, one surrogate step, then one generator step."""
         if not samples:
             return
+        rollout_accumulation_steps = resolve_rollout_accumulation_steps(
+            self.training_args,
+        )
         microbatches = as_role_microbatches(
             samples,
             batch_size=self.training_args.per_device_batch_size,
-            accumulation_steps=self.training_args.gradient_accumulation_steps,
+            accumulation_steps=rollout_accumulation_steps,
             algorithm_name="TDM-R1",
         )
+        boundary_units = self._flatten_boundary_units(microbatches)
         self.adapter.train()
         for _ in role_repeat_progress(
             self, role_name="fake", repeats=self.training_args.ttur_fake_updates
         ):
-            self._fake_phase(microbatches)
-        self._surrogate_phase(microbatches)
-        self._generator_phase(microbatches)
+            self._fake_phase(boundary_units)
+        self._surrogate_phase(boundary_units)
+        self._generator_phase(boundary_units)
 
-    def _surrogate_phase(self, microbatches: Sequence[Sequence[BaseSample]]) -> None:
+    def _surrogate_phase(self, boundary_units: Sequence[TDMBoundaryUnit]) -> None:
         """Update the surrogate with group preference on endpoint advantages."""
         self._ensure_slow_surrogate()
         run_role_phase(
             self,
             "surrogate",
-            microbatches,
-            lambda batch: self._mean_boundary_loss(
-                self._build_boundary_units(batch),
-                self._surrogate_boundary_loss,
-            ),
+            boundary_units,
+            self._surrogate_boundary_loss,
         )
         # Increase snapshot lag gradually so the trust-region clip strengthens over time.
         decay = min(
@@ -146,7 +155,7 @@ class TDMR1Trainer(TDMTrainer):
         record_distillation_metric(self, "train/surrogate_slow_decay", decay)
 
     def _ensure_slow_surrogate(self) -> None:
-        """Create the trust-region snapshot after trainable roles exist."""
+        """Retain lazy compatibility for lightweight, non-constructor test hosts."""
         if not self.adapter.has_variant_snapshot(SLOW_SURROGATE_SNAPSHOT):
             self.adapter.declare_variant_snapshot("surrogate", SLOW_SURROGATE_SNAPSHOT)
 
@@ -342,7 +351,9 @@ class TDMR1Trainer(TDMTrainer):
             active_masks=terms.boundary_state.active_masks,
         )
 
-    def _surrogate_reward_direction(self, batch: Any, terms: Any) -> tuple[LatentState, LatentState]:
+    def _surrogate_reward_direction(
+        self, batch: Any, terms: Any
+    ) -> tuple[LatentState, LatentState]:
         """Return the surrogate's guided direction against its frozen reference.
 
         The surrogate is queried with guidance so its learned preference is amplified the
@@ -431,13 +442,7 @@ class TDMR1Trainer(TDMTrainer):
         batch = self._stack_replay_unit(unit.samples)
         replay_step = self.adapter.get_replay_step(batch, unit.boundary_index - 1)
         boundary_state = detach_state(replay_step.next_state)
-        primary_times = self._sample_perturbation_times(unit)
-        times = self.adapter.build_training_component_times(primary_times, batch=batch)
-        self._validate_score_query_sigmas(
-            times,
-            primary_times,
-            boundary_index=unit.boundary_index,
-        )
+        times = self._sample_score_query_times(unit, batch)
         return batch, self.adapter.add_forward_process_noise(boundary_state, times), times
 
     def _boundary_preference_values(
@@ -454,13 +459,7 @@ class TDMR1Trainer(TDMTrainer):
         batch = self._stack_replay_unit(unit.samples)
         replay_step = self.adapter.get_replay_step(batch, unit.boundary_index - 1)
         boundary_state = detach_state(replay_step.next_state)
-        primary_times = self._sample_perturbation_times(unit)
-        times = self.adapter.build_training_component_times(primary_times, batch=batch)
-        self._validate_score_query_sigmas(
-            times,
-            primary_times,
-            boundary_index=unit.boundary_index,
-        )
+        times = self._sample_score_query_times(unit, batch)
         noised = self.adapter.add_forward_process_noise(boundary_state, times)
         return self._score_boundary_values(batch, noised, times, trainable_role)
 

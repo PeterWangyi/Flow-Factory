@@ -11,20 +11,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Provide the single optional-import boundary for pinned MiniMax H3 support."""
+"""Provide the single optional-import boundary for MiniMax H3 support."""
 
 import inspect
 from dataclasses import dataclass
-from typing import Any, Tuple, Type
+from typing import Any, Callable, Tuple, Type
 
 import torch
 
-MINIMAX_H3_DIFFUSERS_COMMIT = "4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db"
-MINIMAX_H3_INSTALL = (
-    "pip install 'diffusers @ "
-    "git+https://github.com/huggingface/diffusers.git@"
-    f"{MINIMAX_H3_DIFFUSERS_COMMIT}'"
-)
+MINIMAX_H3_DIFFUSERS_MIN_VERSION = "0.40.0"
+MINIMAX_H3_INSTALL = f"pip install 'diffusers>={MINIMAX_H3_DIFFUSERS_MIN_VERSION}'"
 _WORKFLOWS = ("t2va", "fl2va", "ref2va")
 _WORKFLOW_TRIGGERS = {
     "t2va": {"prompt": True},
@@ -59,10 +55,13 @@ _REFERENCE_FIELDS: Tuple[str, ...] = ("ImageReference", "VideoReference", "Audio
 
 @dataclass(frozen=True)
 class MiniMaxH3Symbols:
-    """Hold all pinned upstream classes used by the shared H3 core."""
+    """Hold all upstream symbols used by the shared H3 core."""
 
+    ModularPipeline: Type[Any]
     MiniMaxH3ModularPipeline: Type[Any]
     MiniMaxH3Blocks: Type[Any]
+    MiniMaxH3AttnProcessor: Type[Any]
+    dispatch_attention_fn: Callable[..., torch.Tensor]
     PipelineState: Type[Any]
     ResizeStep: Type[Any]
     RefSetupStep: Type[Any]
@@ -88,6 +87,8 @@ class MiniMaxH3Symbols:
 
 
 try:
+    from diffusers.models.attention_dispatch import dispatch_attention_fn
+    from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3AttnProcessor
     from diffusers.modular_pipelines.minimax_h3.before_denoise import (
         MiniMaxH3FL2VAPrepareLatentsStep,
         MiniMaxH3NoKeyframeAnchorsStep,
@@ -123,9 +124,14 @@ try:
     )
     from diffusers.modular_pipelines.modular_pipeline import PipelineState
 
+    from diffusers import ModularPipeline
+
     _SYMBOLS = MiniMaxH3Symbols(
+        ModularPipeline=ModularPipeline,
         MiniMaxH3ModularPipeline=MiniMaxH3ModularPipeline,
         MiniMaxH3Blocks=MiniMaxH3Blocks,
+        MiniMaxH3AttnProcessor=MiniMaxH3AttnProcessor,
+        dispatch_attention_fn=dispatch_attention_fn,
         PipelineState=PipelineState,
         ResizeStep=MiniMaxH3ResizeStep,
         RefSetupStep=MiniMaxH3Ref2VASetupStep,
@@ -156,7 +162,7 @@ except ImportError as import_error:
 
 
 def require_minimax_h3_support() -> MiniMaxH3Symbols:
-    """Return pinned H3 symbols or raise one actionable feature-probe error.
+    """Return H3 symbols or raise one actionable feature-probe error.
 
     Returns:
         Immutable bundle of required upstream symbols.
@@ -173,6 +179,11 @@ def require_minimax_h3_support() -> MiniMaxH3Symbols:
 
 
 def _probe_symbol_bundle(symbols: MiniMaxH3Symbols) -> None:
+    processor = symbols.MiniMaxH3AttnProcessor()
+    if not callable(processor):
+        raise TypeError("MiniMaxH3AttnProcessor instance must be callable")
+    if not callable(symbols.dispatch_attention_fn):
+        raise TypeError("dispatch_attention_fn must be callable")
     state_values = {"probe": object()}
     try:
         state = symbols.PipelineState(values=state_values)
@@ -269,6 +280,6 @@ def _feature_probe_error(detail: str, cause: Any) -> ImportError:
     cause_text = "" if cause is None else f"; cause={type(cause).__name__}: {cause}"
     return ImportError(
         "MiniMax H3 feature probe failed: "
-        f"{detail}{cause_text}. Required exact diffusers commit "
-        f"{MINIMAX_H3_DIFFUSERS_COMMIT}. Install with: {MINIMAX_H3_INSTALL}"
+        f"{detail}{cause_text}. MiniMax H3 requires "
+        f"diffusers>={MINIMAX_H3_DIFFUSERS_MIN_VERSION}. Install with: {MINIMAX_H3_INSTALL}"
     )

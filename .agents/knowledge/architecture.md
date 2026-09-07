@@ -21,7 +21,7 @@
    └──┬───┬───┬───┘  └──┬───┬───┬──┘  └──┬───┬───┬───┘
       │   │   │         │   │   │         │   │   │
       ▼   ▼   ▼         ▼   ▼   ▼         ▼   ▼   ▼
-    GRPO NFT AWM     Flux SD3 Wan     PickScore CLIP OCR
+    GRPO SFT DPO     Flux SD3 Wan     PickScore CLIP OCR
 ```
 
 ### Key Dependency Rules
@@ -42,51 +42,30 @@
 
 ---
 
-## Six-Stage Training Pipeline
+## Execution Pipelines
 
 > Authoritative reference: `guidance/workflow.md`
 
-```
-Stage 1: Data Preprocessing (offline, cached)
-  │  GeneralDataset + adapter.preprocess_func()
-  │  Text/image/video/audio → encoded tensors (prompt_embeds, image_latents, audio_features, ...)
-  │  Result cached with hash fingerprint
-  ▼
-Stage 2: K-Repeat Sampling
-  │  Three sampler strategies (see `topics/samplers.md`):
-  │  - GroupContiguousSampler (preferred, auto-selected): keeps K copies on same rank
-  │  - DistributedKRepeatSampler (fallback): shuffles K copies across ranks
-  │  - GroupDistributedSampler (DGPO): rank-identical prompt sequence, K/W copies per rank
-  │  K = training_args.group_size
-  ▼
-Stage 3: Trajectory Generation
-  │  adapter.inference() — full multi-step SDE/ODE denoising
-  │  Produces: generated images/videos + trajectory data (noises, log-probs)
-  ▼
-Stage 4: Reward Computation
-  │  RewardProcessor dispatches to Pointwise or Groupwise models
-  │  Multi-reward aggregation with configurable weights
-  ▼
-Stage 5: Advantage Computation
-  │  AdvantageProcessor (advantage/advantage_processor.py)
-  │  Communication-aware: auto-selects gather vs local path
-  │  Strategies: "sum" (weighted-sum, GRPO) or "gdpo"
-  ▼
-Stage 6: Policy Optimization
-  │  adapter.forward() — single-step denoising for loss computation
-  │  Policy gradient (GRPO) or weighted matching (NFT/AWM) or DPO preference loss
-  │  Gradient update via accelerator
-  ▼
-  (Repeat Stages 2–6 for next epoch)
-```
+`ExecutionContract` separates acquisition (`generation` or `dataset`) from feedback
+(`runtime_reward` or `none`). `PipelineIOContract` independently owns model input/output media,
+rates, geometry, and batching.
 
-**Trainer methods vs stages** (each epoch, after Stage 1):
+| Composition | Driver | Optimization entry | Cycle counter |
+|---|---|---|---|
+| Generation + runtime reward | K-repeat → inference → reward → advantage | `optimize(samples)` | `rollout_iteration` |
+| Generation + no feedback | Generation/distillation path | `optimize(samples)` | `rollout_iteration` |
+| Dataset + no feedback | Finite official `DistributedSampler` traversal | `optimize_batch(batch)` | `data_epoch` |
 
-| Method | Stages |
-|--------|--------|
-| `sample()` | 2–3 (K-repeat batches + `adapter.inference` trajectories) |
-| `prepare_feedback()` | 4–5: reward buffer finalize, `AdvantageProcessor` |
-| `optimize()` | 6: `adapter.forward` and optimizer step (DPO: form chosen/rejected pairs at entry, then loss) |
+`optimizer_step` advances independently. A dataset epoch advances only after clean loader
+exhaustion; offline output media is decoded and encoded on the fly, while only prompt/input
+conditions enter the preprocessing cache.
+
+Exact runtime identity is built from realized prepared state. It locks optimizer/model/backend
+semantics, the checkpoint-realized pipeline I/O contract, ordered training data, and the complete
+replayed evaluation path (cadence, arguments,
+per-dataset overrides, rewards, and ordered prepared loaders). Logging, checkpoint cadence, run
+budget, and resume location remain operational. Exact-state save fails before mutation on MPS
+because Accelerate does not persist the device RNG needed for exact continuation.
 
 ---
 
@@ -100,6 +79,8 @@ All four registries map string keys → lazy import paths. Resolution: registry 
 
 | Key | Class | Paradigm | Base Class |
 |-----|-------|----------|------------|
+| `sft` | `SFTTrainer` | Decoupled, dataset | `BaseTrainer` |
+| `offline-dpo` | `OfflineDPOTrainer` | Decoupled, dataset | `BaseTrainer` |
 | `grpo` | `GRPOTrainer` | Coupled | `BaseTrainer` |
 | `grpo-guard` | `GRPOGuardTrainer` | Coupled | `GRPOTrainer` |
 | `dppo` | `DPPOTrainer` | Coupled | `GRPOTrainer` |
@@ -108,9 +89,14 @@ All four registries map string keys → lazy import paths. Resolution: registry 
 | `nft` | `DiffusionNFTTrainer` | Decoupled | `BaseTrainer` |
 | `awm` | `AWMTrainer` | Decoupled | `BaseTrainer` |
 | `crd` | `CRDTrainer` | Decoupled | `BaseTrainer` |
-| `diffusion-opd` | `DiffusionOPDTrainer` | Distillation (on-policy) | `BaseTrainer` |
+| `diffusion-opd` | `DiffusionOPDTrainer` | Distillation, generation + no feedback | `BaseTrainer` |
+| `dmd2` | `DMD2Trainer` | Distillation, generation + no feedback, ODE | `BaseTrainer` |
+| `tdm` | `TDMTrainer` | Distillation, generation + no feedback, ODE | `BaseTrainer` |
+| `tdm-r1` | `TDMR1Trainer` | Decoupled, generation + runtime reward, ODE | `TDMTrainer` |
 
-**Flat hierarchy**: New trainers inherit from `BaseTrainer` directly. The sanctioned exceptions are `GRPOGuardTrainer → GRPOTrainer` and `DPPOTrainer → GRPOTrainer` (strict GRPO loss variants; see constraint #11).
+**Flat hierarchy**: New trainers inherit from `BaseTrainer` directly. The sanctioned existing
+extensions are `GRPOGuardTrainer → GRPOTrainer`, `DPPOTrainer → GRPOTrainer`, and
+`TDMR1Trainer → TDMTrainer`; see constraint #11.
 
 **Model Adapters** (`models/registry.py`):
 | Key | Class | Task |
@@ -125,10 +111,13 @@ All four registries map string keys → lazy import paths. Resolution: registry 
 | `z-image` | `ZImageAdapter` | Text-to-Image |
 | `wan2_t2v` | `Wan2_T2V_Adapter` | Text-to-Video |
 | `wan2_i2v` | `Wan2_I2V_Adapter` | Image-to-Video |
-| `wan2_v2v` | `Wan2_V2V_Adapter` | Video-to-Video |
 | `ltx2_t2av` | `LTX2_T2AV_Adapter` | Text-to-Audio-Video |
 | `ltx2_i2av` | `LTX2_I2AV_Adapter` | Image-to-Audio-Video |
+| `minimax-h3-t2va` | `MiniMaxH3T2VAAdapter` | Text-to-Video-Audio |
+| `minimax-h3-fl2va` | `MiniMaxH3FL2VAAdapter` | Sparse First/Last-Frame-to-Video-Audio |
+| `minimax-h3-ref2va` | `MiniMaxH3Ref2VAAdapter` | Ordered-Reference-to-Video-Audio |
 | `bagel` | `BagelAdapter` | Text-to-Image & Image(s)-to-Image (T2I & I2I both batched via NaViT packing; subset-round packing handles variable I2I reference-image count, no per-sample fallback — see `topics/adapter_conventions.md`) |
+| `sensenova` | `SenseNovaAdapter` | Text-to-Image & Image(s)-to-Image (SenseNova-U1 1.0/1.5; ordered variable-count references remain grouped in `images` and preserve within-type order; independent samples use B=1 prefixes rather than Bagel-style NaViT packing) |
 
 **Reward Models** (`rewards/registry.py`):
 | Key | Class | Type |
@@ -153,7 +142,7 @@ All four registries map string keys → lazy import paths. Resolution: registry 
 |-----|-------|--------|-------|-------|
 | `attention_backend` | `AttentionBackendAccelerator` | lossless | both | Sets the diffusers attention backend on every transformer (requires a `backend` param). Listed as a `shared` entry (before `torch_compile`); this is the single code path for backend selection (the old `BaseAdapter._set_attention_backend` and the `model.attn_backend` knob were both removed — a config still setting `model.attn_backend` fails fast). Bagel forces flash_attention_2 at load and does not use it. |
 | `torch_compile` | `CompileAccelerator` | lossy | both | `torch.compile` of the shared transformer (`auto` default: regional when `_repeated_blocks` is available, otherwise full; explicit regional/full overrides); applied in-place after `post_init` so checkpoint keys / param identity stay stable. Marked `lossy` because it is applied symmetrically but is **not bit-exact across rollout vs training** (Inductor's grad/no-grad graph split → intermittent ~1e-5 on-policy residual, within `clip_range`); still allowed on coupled algos, validator warns. |
-| `diffusers_cache` | `DiffusersCacheAccelerator` | lossy | rollout | Diffusers `CacheMixin` feature caching (first_block/faster/pyramid/taylorseer/magcache), gated by the adapter's explicit `supports_diffusers_cache` capability before any component is mutated. |
+| `diffusers_cache` | `DiffusersCacheAccelerator` | lossy | rollout | Diffusers `CacheMixin` feature caching (first_block/faster/pyramid/taylorseer/magcache), gated before mutation by `supports_diffusers_cache` plus the optional `supported_diffusers_cache_policies` whitelist. MiniMax H3 T2VA/FL2VA/Ref2VA internally bridge diffusers 0.40.0 for `first_block` only and reject combination with Flow-Factory `torch_compile`. |
 
 Configured via the `acceleration:` block (`hparams/acceleration_args.py`): two ordered lists of `{name, params}` entries — `shared` (persistent `stage='both'` accelerators applied to rollout and training) and `rollout` (Stage-3 only). **List order is application order**: `shared` entries run their `setup()` in order (so `attention_backend` must precede `torch_compile`), and `rollout` entries nest their `rollout_context()` in order. The `acceleration/validator.py` enforces that a **lossy `rollout`** accelerator runs only on `decoupled`/`distillation` trainers (each trainer declares a `paradigm`), preserving train-inference consistency (constraint #7). A **lossy `stage='both'` accelerator in the `shared` slot** (e.g. `torch_compile`, applied symmetrically but not bit-exact across stages) is allowed on any paradigm but the validator **warns** on coupled trainers that the on-policy ratio will be ≈1, not exactly 1. Off by default.
 
@@ -163,7 +152,7 @@ Configured via the `acceleration:` block (`hparams/acceleration_args.py`): two o
 
 - **New model adapter**: `guidance/new_model.md`, skill `/ff-new-model`, conventions `topics/adapter_conventions.md`
 - **New reward model**: `guidance/rewards.md`, skill `/ff-new-reward`
-- **New algorithm**: `guidance/algorithms.md`, skill `/ff-new-algorithm`. `BaseTrainer` owns the epoch loop (`start`), timestep sampling, feedback/advantages, the optimizer step and the velocity KL; only `optimize()` is abstract. Vary behavior through `sampling_context`, `_run_training_step`, `_after_gradient_step` and `_after_optimizer_step` rather than by restating the loop. An algorithm that trains several model copies declares them in `_declare_model_variants()` (`topics/component_variants.md`).
+- **New algorithm**: `guidance/algorithms.md`, skill `/ff-new-algorithm`. `BaseTrainer` owns the cycle loop, acquisition drivers, feedback/advantages, optimizer step, and velocity KL. Generation trainers implement `optimize(samples)`; dataset trainers implement `optimize_batch(batch)`. An algorithm that trains several model copies declares them in `_declare_model_variants()` (`topics/component_variants.md`).
 - **New accelerator**: subclass `acceleration/abc.py::BaseAccelerator` (declare `safety`/`stage`), register in `acceleration/registry.py`
 
 ---
@@ -176,11 +165,27 @@ Timesteps are `[0, 1000]` (scheduler scale); sigmas are `[0, 1]` (flow-matching 
 
 ### Adapter Pattern (Models)
 Each model adapter wraps a diffusers pipeline into the `BaseAdapter` interface:
-- `preprocess_func()` — offline encoding (Stage 1)
+- `preprocess_func()` — prompt/input-condition preprocessing and cache projection
+- `pipeline_io_contract` — model-neutral input/output modality and geometry declaration
+- `effective_pipeline_io_contract` — checkpoint-realized specialization of the class contract
+- `prepare_condition_state()` — one validated input-owned runtime realization reused across
+  candidate encoding and model forwards
+- `encode_output_state()` — validated on-the-fly offline target encoding through an optional codec
 - `inference()` — full denoising loop (Stage 3)
 - `forward()` — single-step denoising (Stage 6)
 
 **Per-modality encoders** (`encode_prompt`, `encode_image`, `encode_video`, `encode_audio`) are no-op by default on `BaseAdapter` — override only the modalities your model consumes. `preprocess_func` dispatches to all four and skips any that return `None`, so text/image/video-only adapters need no stub overrides for unused modalities.
+
+Offline condition preparers and codecs declare logical required components without materializing
+them. Condition/output encoders share role-neutral transforms where possible, while callers retain
+explicit official posterior `sample` versus `argmax` semantics. Candidate-specific output context
+cannot overwrite cached or prepared input fields. A separate flow-matching objective reducer lets
+multi-modal SFT/DPO specialize loss aggregation without changing online trajectory reductions.
+
+Input contracts may declare semantic media slots and aggregate cross-type cardinality rules. In
+strict V2 data, an explicit input-only `slot` reserves its argument; unslotted media fills remaining
+slots in declaration order. Outputs reject slots. This keeps algorithm data model-neutral while the
+adapter owns bindings such as first/last frame and ordered heterogeneous references.
 
 **Flat hierarchy**: All adapters inherit directly from `BaseAdapter` — never from another adapter (see constraint #12). Shared logic within a model family uses helper functions, code duplication, or mixins — not adapter subclassing.
 
@@ -206,8 +211,14 @@ non-`None` modular specs but exclude absent classic optional components. The def
 `ClassicPipelineRuntime` preserves eager DiffusionPipeline behavior;
 `ModularPipelineRuntime` materializes selected lazy component specs; and
 `PseudoPipelineRuntime` manages explicit containers and non-enumerated aliases such as Bagel's
-`transformer -> bagel.language_model`. `adapter.pipeline` remains the backend compatibility alias,
+`transformer -> bagel.language_model`, as well as direct canonical components such as SenseNova's
+`transformer -> SenseNovaDenoiser`. `adapter.pipeline` remains the backend compatibility alias,
 while `ModelBundle` and `RoutedComponentProxy` remain the sole distributed preparation runtime.
+`loading/` compiles logical component names into physical ownership roots before trainer-stage
+loads. `ModelLoadCoordinator` excludes prepared target routes from auxiliary movement while
+allowing frozen siblings in the same composite root to become resident. `BackendLoadRuntime`
+owns FSDP target-buffer setup, replicated-load scopes, and cached sampled fingerprints. Trainer
+methods only request component loading and distributed preparation.
 `SchedulerGroup` separately provides immutable component names and ordered scheduler mode/seed
 dispatch; its primary scheduler remains available through `adapter.scheduler`.
 
@@ -280,19 +291,19 @@ Details: `topics/component_variants.md`.
 
 ### Reward Processing
 `RewardProcessor` dispatches by model type:
-- **Pointwise**: batch by `batch_size`
+- **Pointwise**: applicable sub-batches of at most `batch_size`
 - **Groupwise**: group by `unique_id` (local or distributed path)
 - **Multi-reward**: weighted aggregation
 - **Async**: optional non-blocking computation
 
 ### Advantage Computation
-`AdvantageProcessor` (`advantage/advantage_processor.py`): communication-aware, auto-selects gather vs local path. Strategies: `"sum"` (GRPO) and `"gdpo"`. All reward-based trainers delegate to `self.advantage_processor.compute_advantages()`; the distillation trainer `diffusion-opd` is the exception (its `prepare_feedback()` is a no-op — no reward/advantage stage).
+`AdvantageProcessor` (`advantage/advantage_processor.py`): communication-aware, auto-selects gather vs local path. Strategies: `"sum"` (GRPO) and `"gdpo"`. Runtime-reward trainers delegate to `self.advantage_processor.compute_advantages()`. Feedback-`none` trainers (`diffusion-opd`, DMD2, and TDM) bypass reward and advantage stages structurally.
 
 ### Configuration Hierarchy
 ```
 Arguments (top-level)
 ├── ModelArguments        # model_type, model_path, finetune_type, LoRA config
-├── TrainingArguments     # Algorithm-specific (GRPO/DPO/NFT/AWM subclass)
+├── TrainingArguments     # Algorithm-specific (SFT/offline-DPO/GRPO/DPO/etc.)
 ├── SchedulerArguments    # dynamics_type, timestep_range, num_inference_steps
 ├── DataArguments         # dataset, preprocessing, resolution, sampler_type
 ├── MultiRewardArguments  # reward_model configs (list of RewardArguments)
